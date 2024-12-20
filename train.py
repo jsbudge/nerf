@@ -48,7 +48,7 @@ if __name__ == '__main__':
                                exp_params['train_params']['max_epochs'] * exp_params['learn_params']['swa_start'])),
                       1e-9)
     trainer = Trainer(logger=logger, max_epochs=exp_params['train_params']['max_epochs'],
-                      log_every_n_steps=exp_params['train_params']['log_epoch'], devices=[1], callbacks=
+                      log_every_n_steps=exp_params['train_params']['log_epoch'], devices=[0], callbacks=
                       [EarlyStopping(monitor='train_loss', patience=exp_params['train_params']['patience'],
                                      check_finite=True),
                        StochasticWeightAveraging(swa_lrs=expected_lr,
@@ -65,6 +65,10 @@ if __name__ == '__main__':
     print('Rendering image...')
     with torch.no_grad():
         rgb, disp, acc = mdl.render_image(poses.unsqueeze(0).to(mdl.device), target.shape[0], target.shape[1], data.focal)
+
+    print('Rendering model...')
+    with torch.no_grad():
+        verts, tris = mdl.render_model((-1., 1.), (-1., 1.), (0., 1.), 100, 100, 100)
 
     plt.figure()
     plt.subplot(2, 1, 1)

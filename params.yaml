@@ -9,12 +9,12 @@ exp_params:
     betas: [ .9, .99 ]
     step_size: 1
   model_params:
-    D: 1
-    hidden: 16
+    D: 8
+    hidden: 256
     randomized: False
     ray_shape: cone
     num_levels: 2
-    num_samples: 32
+    num_samples: 128
     density_noise: 1
     density_bias: -1
     rgb_padding: 0.001
@@ -33,8 +33,8 @@ exp_params:
     log_dir: ./logs
   dataset_params:
     data_path: ./data/nerf_synthetic/nerf_synthetic/lego
-    train_batch_size: 4096
-    val_batch_size: 4096
+    train_batch_size: 256
+    val_batch_size: 256
     near: 0.
     far: 1.
     num_workers: 0
@@ -46,19 +46,19 @@ exp_params:
 # For SARNeRF
 sar_exp_params:
   learn_params:
-    LR: 0.0005
-    weight_decay: 0.1
+    LR: 0.01
+    weight_decay: 0.01
     scheduler_gamma: 0.9
     coarse_weight_decay: 0.1
     swa_start: .6
     betas: [ .9, .99 ]
     step_size: 1
   model_params:
-    D: 8
-    hidden: 128
+    D: 4
+    hidden: 256
     randomized: False
     ray_shape: cone
-    num_levels: 2
+    num_levels: 1
     num_samples: 64
     density_noise: 1
     density_bias: -1
@@ -67,7 +67,7 @@ sar_exp_params:
     min_deg: 0
     max_deg: 16
     return_raw: False
-    pulse_std: 510785839.02234054
+    pulse_std: 781026276.4943413
   train_params:
     warm_start: False
     log_epoch: 100
@@ -78,12 +78,13 @@ sar_exp_params:
     max_epochs: 1000
     log_dir: ./logs
   dataset_params:
-    data_path: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_112906.sar
+    data_path: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_113146.sar
+    data_center: [40.0935619700, -111.7683527700, 1353.06885]
     train_batch_size: 1
     val_batch_size: 1
-    fft_sz: 32768
-    az_samples: 64
-    el_samples: 64
+    fft_sz: 8192
+    az_samples: 32
+    el_samples: 32
     num_workers: 0
     pin_memory: False
     split: .7

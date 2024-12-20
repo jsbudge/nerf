@@ -338,7 +338,7 @@ def volumetric_rendering(rgb, density, t_vals, dirs, white_bkgd):
     return comp_rgb, distance, acc, weights, alpha
 
 
-def volumetric_scattering(norm, density, rays_p, t_vals, dirs, pulse_bins, wavelength):
+def volumetric_scattering(norm, density, rcs, rays_p, t_vals, dirs, pulse_bins, near_range, wavelength):
     """Volumetric Rendering Function.
 
     Args:
@@ -357,7 +357,7 @@ def volumetric_scattering(norm, density, rays_p, t_vals, dirs, pulse_bins, wavel
     t_mids = 0.5 * (t_vals[..., :-1] + t_vals[..., 1:])
     t_dists = t_vals[..., 1:] - t_vals[..., :-1]
     delta = t_dists * torch.linalg.norm(dirs[..., None, :], dim=-1)
-    density_delta = density * delta
+    density_delta = density[..., 0] * delta
 
     alpha = 1 - torch.exp(-density_delta)
     trans = torch.exp(-torch.cat([
@@ -368,12 +368,16 @@ def volumetric_scattering(norm, density, rays_p, t_vals, dirs, pulse_bins, wavel
 
     comp_norm = (weights[..., None] * norm).sum(dim=-2)
     comp_norm = comp_norm / torch.linalg.norm(comp_norm, dim=-1)[..., None]
+    comp_rcs = (weights[..., None] * rcs).sum(dim=-2)
     acc = weights.sum(dim=-1)
     distance = (weights * t_mids).sum(dim=-1) / acc
-    distance = torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1])
+    distance = (torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1]) *
+                (pulse_bins[1] - pulse_bins[0]) + near_range)
     # Apply Phong reflection model to get reflected power
     bounce = comp_norm * torch.sum(dirs * comp_norm, dim=-1)[..., None] * 2 - dirs
-    nrho = rays_p * (torch.sum(dirs * comp_norm, dim=-1) + torch.sum(bounce * comp_norm, dim=-1)**2) / distance**2
+    nrho = rays_p * (torch.sum(dirs * comp_norm, dim=-1) * comp_rcs[..., 0] +
+                     torch.nan_to_num(torch.abs(torch.sum(bounce * comp_norm, dim=-1) *
+                                                comp_rcs[..., 1])**comp_rcs[..., 2])) / distance**2
     # Calculate out expected phase as well
     ret = torch.view_as_real(nrho * torch.exp(-2j * torch.pi / wavelength * distance * 2))
     pulse = torch.zeros((nrho.shape[0], pulse_bins.shape[0], 2), dtype=torch.float, device=nrho.device)

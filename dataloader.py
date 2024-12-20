@@ -12,6 +12,8 @@ from simulib.simulation_functions import azelToVec
 from sklearn.model_selection import train_test_split
 from utils import load_blender_data, get_blender_params, rays_from_pose, rot_roll, rot_yaw
 
+c0 = 299792458.0
+
 
 def collate_fun(batch):
     return (torch.stack([ccd for ccd, _, _, _, _, _ in batch]), torch.stack([tcd for _, tcd, _, _, _, _ in batch]),
@@ -139,10 +141,10 @@ class ImageDataset(Dataset):
 
 
 class SDRPulseDataset(Dataset):
-    def __init__(self, sdr_file: str, split: float = 1., fft_sz: int = 16384, az_samples: int = 32,
+    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, fft_sz: int = 16384, az_samples: int = 32,
                  el_samples: int = 32, pulse_std: float = 1., single_example: bool = False, is_val=False, seed=42):
         sdr_f = load(sdr_file)
-        idxes = np.arange(sdr_f[0].nframes)
+        idxes = np.arange(sdr_f[0].nframes)[::5]
 
         if split < 1:
             Xs, Xt = train_test_split(idxes, test_size=split, random_state=seed)
@@ -151,29 +153,37 @@ class SDRPulseDataset(Dataset):
             Xs = idxes
 
         i_vals = Xs if is_val else Xt
-        rp = SDRPlatform(sdr_f, channel=0)
+        rp = SDRPlatform(sdr_f, origin=data_center, channel=0)
+        rp.fs = sdr_f[0].fs
         self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[i_vals]), dtype=torch.float)
         self.pans = rp.pan(sdr_f[0].pulse_time[i_vals])
         self.tilts = rp.tilt(sdr_f[0].pulse_time[i_vals])
         self.pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
                                   sdr_f.genMatchedFilter(0, fft_len=fft_sz), axis=1)[:, :sdr_f[0].nsam]
         self.pulses = torch.view_as_real(torch.tensor(self.pulses / pulse_std))
-        self.mfilt = sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz)
-        near, far = rp.calcRanges(0, .5)
+        self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz))
+        self.mfilt = self.mfilt / self.mfilt.shape[0]
+        near, far = rp.calcRanges(5.0, .75)
 
         azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw, rp.az_half_bw, az_samples), np.linspace(-rp.el_half_bw, rp.el_half_bw, el_samples))
         self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
         dx = torch.sqrt(torch.sum((self.pvecs[:-1] - self.pvecs[1:]) ** 2, dim=-1))
         dx = torch.cat([dx, dx[-2:-1]], 0)
-        self.radii = (dx * 0.5773502691896258)
-        self.near = torch.zeros_like(self.radii) + near
-        self.far = torch.zeros_like(self.radii) + far
-        self.ray_p = np.sinc(azes.flatten() / rp.az_half_bw) * np.sinc(eles.flatten() / rp.el_half_bw)
+        radii = dx
+        ray_p = np.sinc(azes.flatten() / rp.az_half_bw) * np.sinc(eles.flatten() / rp.el_half_bw) * 10
+        ray_mask = ray_p > 1e-9
+        self.pvecs = self.pvecs[ray_mask]
+        self.radii = radii[ray_mask]
+        self.ray_p = ray_p[ray_mask]
+        self.near = near
+        self.far = far
+        self.mpp = c0 / rp.fs / 2
 
 
     def __getitem__(self, idx):
         ray_d = self.pvecs @ rot_yaw(self.pans[idx]) @ rot_roll(self.tilts[idx])
-        return torch.outer(torch.ones_like(self.radii), self.pos[idx]), ray_d, self.ray_p, self.mfilt, self.radii, self.near, self.far, self.pulses[idx]
+        return (torch.outer(torch.ones_like(self.radii), self.pos[idx]), ray_d, self.ray_p, self.mfilt, self.radii,
+                self.near, self.far, self.mpp, self.pulses[idx])
 
     def __len__(self):
         return self.pulses.shape[0]
@@ -183,6 +193,7 @@ class SDRDataModule(BaseModule):
     def __init__(
             self,
             data_path: str,
+            data_center: list = None,
             train_batch_size: int = 8,
             val_batch_size: int = 8,
             fft_sz: int = 16384,
@@ -198,6 +209,7 @@ class SDRDataModule(BaseModule):
         super().__init__(train_batch_size, val_batch_size, pin_memory, single_example, device)
 
         self.data_dir = data_path
+        self.data_center = data_center
         self.fft_sz = fft_sz
         self.split = split
         self.device = device
@@ -207,9 +219,9 @@ class SDRDataModule(BaseModule):
 
     def setup(self, stage: Optional[str] = None) -> None:
         self.train_dataset = SDRPulseDataset(self.data_dir, az_samples = self.az_samples,
-                 el_samples=self.el_samples, split=self.split, pulse_std=self.pulse_std, fft_sz=self.fft_sz)
+                 el_samples=self.el_samples, split=self.split, data_center=self.data_center, pulse_std=self.pulse_std, fft_sz=self.fft_sz)
         self.val_dataset = SDRPulseDataset(self.data_dir, az_samples = self.az_samples,
-                 el_samples=self.el_samples, split=self.split, pulse_std=self.pulse_std, fft_sz=self.fft_sz, is_val=True)
+                 el_samples=self.el_samples, split=self.split, data_center=self.data_center, pulse_std=self.pulse_std, fft_sz=self.fft_sz, is_val=True)
 
 
 class ImageDataModule(BaseModule):
