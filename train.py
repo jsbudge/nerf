@@ -1,79 +1,66 @@
-import pickle
+import os.path
+import imageio
+from pytorch_lightning import Trainer, loggers, seed_everything
+from config import get_config
+from model import MipNeRF
+from os import path
+from dataloader import NeRFModule
+from tqdm import tqdm
 import numpy as np
 import torch
-from pytorch_lightning import Trainer, loggers, seed_everything
-from pytorch_lightning.callbacks import EarlyStopping, StochasticWeightAveraging
-import yaml
-from dataloader import ImageDataModule
-from model import NeRF
-import matplotlib.pyplot as plt
+from utils import visualize_depth, visualize_normals, to8b
 
-
-def force_cudnn_initialization():
-    s = 32
-    dev = torch.device('cuda')
-    torch.nn.functional.conv2d(torch.zeros(s, s, s, s, device=dev), torch.zeros(s, s, s, s, device=dev))
-
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     torch.autograd.set_detect_anomaly(True)
-    force_cudnn_initialization()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # torch.cuda.empty_cache()
 
     seed_everything(np.random.randint(1, 2048), workers=True)
-    # seed_everything(17, workers=True)
+    config = get_config(param_file='./params.yaml')
+    model_save_path = path.join(config.log_dir, "model.pt")
+    optimizer_save_path = path.join(config.log_dir, "optim.pt")
 
-    with open('./params.yaml', 'r') as file:
-        try:
-            config = yaml.safe_load(file)
-        except yaml.YAMLError as exc:
-            print(exc)
-
-    exp_params = config['exp_params']
-
-
-
-    data = ImageDataModule(device=device, **exp_params["dataset_params"])
+    data = NeRFModule(config)
     data.setup()
-    logger = loggers.TensorBoardLogger(exp_params['train_params']['log_dir'],
-                                       name="NeRF", log_graph=True)
 
-    mdl = NeRF(**exp_params['model_params'], learn_params=exp_params['learn_params'])
+    model = MipNeRF(
+        config=config,
+    )
+    model.train()
 
-    expected_lr = max((exp_params['learn_params']['LR'] *
-                       exp_params['learn_params']['scheduler_gamma'] ** (
-                               exp_params['train_params']['max_epochs'] * exp_params['learn_params']['swa_start'])),
-                      1e-9)
-    trainer = Trainer(logger=logger, max_epochs=exp_params['train_params']['max_epochs'],
-                      log_every_n_steps=exp_params['train_params']['log_epoch'], devices=[0], callbacks=
-                      [EarlyStopping(monitor='train_loss', patience=exp_params['train_params']['patience'],
-                                     check_finite=True),
-                       StochasticWeightAveraging(swa_lrs=expected_lr,
-                                                 swa_epoch_start=exp_params['learn_params']['swa_start'])])
+    os.makedirs(config.log_dir, exist_ok=True)
+    logger = loggers.TensorBoardLogger(config.log_dir, name="NeRF", log_graph=True)
+
+    print('Building trainer...')
+    trainer = Trainer(logger=logger, max_epochs=config.max_steps, devices=[0])
 
     print("======= Training =======")
     try:
-        trainer.fit(mdl, datamodule=data)
+        trainer.fit(model, datamodule=data)
     except KeyboardInterrupt:
         print('Breaking out of training early.')
 
-    target, poses = data.val_dataset.getImage(0)
+    torch.save(model.state_dict(), model_save_path)
 
-    print('Rendering image...')
-    with torch.no_grad():
-        rgb, disp, acc = mdl.render_image(poses.unsqueeze(0).to(mdl.device), target.shape[0], target.shape[1], data.focal)
+    render_data = data.render_loader()
+    model.eval()
 
-    print('Rendering model...')
-    with torch.no_grad():
-        verts, tris = mdl.render_model((-1., 1.), (-1., 1.), (0., 1.), 100, 100, 100)
+    print("Generating Video using", len(render_data), "different view points")
+    rgb_frames = []
+    if config.visualize_depth:
+        depth_frames = []
+    if config.visualize_normals:
+        normal_frames = []
+    for ray in tqdm(render_data):
+        img, dist, acc = model.render_image(ray, render_data.h, render_data.w, chunks=config.chunks)
+        rgb_frames.append(img)
+        if config.visualize_depth:
+            depth_frames.append(to8b(visualize_depth(dist, acc, render_data.near, render_data.far)))
+        if config.visualize_normals:
+            normal_frames.append(to8b(visualize_normals(dist, acc)))
 
-    plt.figure()
-    plt.subplot(2, 1, 1)
-    plt.imshow(rgb)
-    plt.subplot(2, 1, 2)
-    plt.imshow(target)
-    plt.show()
-
+    imageio.mimwrite(path.join(config.log_dir, "video.mp4"), rgb_frames, fps=30, quality=10, codecs="hvec")
+    if config.visualize_depth:
+        imageio.mimwrite(path.join(config.log_dir, "depth.mp4"), depth_frames, fps=30, quality=10, codecs="hvec")
+    if config.visualize_normals:
+        imageio.mimwrite(path.join(config.log_dir, "normals.mp4"), normal_frames, fps=30, quality=10, codecs="hvec")

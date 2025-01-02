@@ -78,14 +78,16 @@ if __name__ == '__main__':
                                mfilt.to(mdl.device), radii.to(mdl.device), near.to(mdl.device), far.to(mdl.device),
                                target.shape[1], mpp.to(mdl.device))
 
-        verts, tris = mdl.render_model((-100., 100.), (-100., 100.), (-5., 10.), 100, 100, 100, sigma_threshold=10.,
+        disp_np = disp.cpu().data.numpy()
+
+        verts, tris = mdl.render_model((-100., 100.), (-100., 100.), (-5., 10.), 100, 100, 100, sigma_threshold=50.,
                                        chunks=1000)
     np_pulse = pulse.cpu().data.numpy()
     np_target = target.cpu().data.numpy()
 
     plt.figure()
     plt.subplot(2, 1, 1)
-    plt.plot(np_pulse[1, 0, :, 0])
+    plt.plot(np_pulse[-1, 0, :, 0])
     plt.subplot(2, 1, 2)
     plt.plot(np_target[0, :, 0])
     plt.show()
@@ -96,9 +98,9 @@ if __name__ == '__main__':
     bores = rp.boresight(rp.gpst)
     fig = px.scatter_3d(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2])
     fig.add_trace(go.Cone(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2], u=bores[:, 0],
-                          v=bores[:, 0], w=bores[:, 1], anchor='tail', sizeref=25, sizemode='absolute'))
+                          v=bores[:, 1], w=bores[:, 2], anchor='tail', sizeref=55, sizemode='absolute'))
     fig.add_trace(go.Cone(x=rays_o[0, :, 0], y=rays_o[0, :, 1], z=rays_o[0, :, 2], u=rays_d[0, :, 0],
-                          v=rays_d[0, :, 1], w=rays_d[0, :, 2], anchor='tail', sizeref=.5, sizemode='absolute'))
+                          v=rays_d[0, :, 1], w=rays_d[0, :, 2], anchor='tail', sizeref=55, sizemode='absolute'))
     fig.update_layout(
         scene=dict(xaxis=dict(range=[flight_path[:, 0].min(), flight_path[:, 0].max()]),
                    yaxis=dict(range=[flight_path[:, 1].min(), flight_path[:, 1].max()]),

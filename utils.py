@@ -1,62 +1,16 @@
-import contextlib
-import pickle
-from typing import Optional, Union, Tuple, Dict
-import torch
-import torchist
-from torch import nn, Tensor
-from pytorch_lightning import LightningModule
-from torch.nn import functional as nn_func
-from PIL import Image
 import numpy as np
-import os
-import imageio
-import json
+import torch
+import collections
+import matplotlib.cm as cm
+from scipy import signal
 
 
-def init_weights(m):
-    with contextlib.suppress(ValueError):
-        if hasattr(m, 'weight'):
-            torch.nn.init.xavier_normal_(m.weight)
-        # sourcery skip: merge-nested-ifs
-        if hasattr(m, 'bias'):
-            if m.bias is not None:
-                m.bias.data.fill_(.01)
+Rays = collections.namedtuple('Rays', ('origins', 'directions', 'viewdirs', 'radii', 'lossmult', 'near', 'far'))
 
 
-def ndc_rays(H, W, focal, near, rays_o, rays_d):
-    # Shift ray origins to near plane
-    t = -(near + rays_o[..., 2]) / rays_d[..., 2]
-    rays_o = rays_o + t[..., None] * rays_d
-
-    # Projection
-    o0 = -1. / (W / (2. * focal)) * rays_o[..., 0] / rays_o[..., 2]
-    o1 = -1. / (H / (2. * focal)) * rays_o[..., 1] / rays_o[..., 2]
-    o2 = 1. + 2. * near / rays_o[..., 2]
-
-    d0 = -1. / (W / (2. * focal)) * (rays_d[..., 0] / rays_d[..., 2] - rays_o[..., 0] / rays_o[..., 2])
-    d1 = -1. / (H / (2. * focal)) * (rays_d[..., 1] / rays_d[..., 2] - rays_o[..., 1] / rays_o[..., 2])
-    d2 = -2. * near / rays_o[..., 2]
-
-    rays_o = torch.stack([o0, o1, o2], -1)
-    rays_d = torch.stack([d0, d1, d2], -1)
-
-    return rays_o, rays_d
-
-
-def rays_from_pose(W, H, focal, poses, near, far):
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
-    camera_dirs = torch.tensor(np.stack([(i - W * .5 + .5) / focal, -(j - H * .5 + .5) / focal,
-                                         -np.ones_like(i)], -1)).unsqueeze(0).to(poses.device)
-    rays_d = torch.einsum('bijk,bkk->bijk', camera_dirs, poses[:, :3, :3])
-    rays_o = torch.ones(rays_d.shape, device=poses.device) * poses[:, :3, -1][:, None, None, :]
-    dx = torch.sqrt(torch.sum((rays_d[:, :-1, :, :] - rays_d[:, 1:, :, :]) ** 2, dim=-1))
-    dx = torch.cat([dx, dx[:, -2:-1, :]], 1).unsqueeze(1)
-    radii = (dx * 0.5773502691896258).reshape((-1, 1))
-    rays_d = rays_d.reshape((-1, 3))
-    rays_o = rays_o.reshape((-1, 3))
-    near = torch.zeros_like(radii) + near
-    far = torch.zeros_like(radii) + far
-    return rays_d, rays_o, radii, near, far
+def namedtuple_map(fn, tup):
+    """Apply `fn` to each element of `tup` and cast to `tup`'s namedtuple."""
+    return type(tup)(*map(fn, tup))
 
 
 def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
@@ -107,6 +61,29 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     t = torch.clip(torch.nan_to_num((u - cdf_g0) / (cdf_g1 - cdf_g0), 0), 0, 1)
     samples = bins_g0 + t * (bins_g1 - bins_g0)
     return samples
+
+
+def convert_to_ndc(origins, directions, focal, w, h, near=1.):
+    """Convert a set of rays to NDC coordinates."""
+    # Shift ray origins to near plane
+    t = -(near + origins[..., 2]) / (directions[..., 2] + 1e-15)
+    origins = origins + t[..., None] * directions
+
+    dx, dy, dz = tuple(np.moveaxis(directions, -1, 0))
+    ox, oy, oz = tuple(np.moveaxis(origins, -1, 0))
+
+    # Projection
+    o0 = -((2 * focal) / w) * (ox / (oz + 1e-15))
+    o1 = -((2 * focal) / h) * (oy / (oz+ 1e-15) )
+    o2 = 1 + 2 * near / (oz+ 1e-15)
+
+    d0 = -((2 * focal) / w) * (dx / (dz+ 1e-15) - ox / (oz+ 1e-15))
+    d1 = -((2 * focal) / h) * (dy / (dz+ 1e-15) - oy / (oz+ 1e-15))
+    d2 = -2 * near / (oz+ 1e-15)
+
+    origins = np.stack([o0, o1, o2], -1)
+    directions = np.stack([d0, d1, d2], -1)
+    return origins, directions
 
 
 def lift_gaussian(d, t_mean, t_var, r_var, diag):
@@ -246,6 +223,9 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far, random
         lower = torch.cat([t_vals[..., :1], mids], -1)
         t_rand = torch.rand(batch_size, num_samples + 1, device=origins.device)
         t_vals = lower + (upper - lower) * t_rand
+    else:
+        # Broadcast t_vals to make the returned shape consistent.
+        t_vals = torch.broadcast_to(t_vals, [batch_size, num_samples + 1])
     means, covs = cast_rays(t_vals, origins, directions, radii, ray_shape)
     return t_vals, (means, covs)
 
@@ -338,213 +318,82 @@ def volumetric_rendering(rgb, density, t_vals, dirs, white_bkgd):
     return comp_rgb, distance, acc, weights, alpha
 
 
-def volumetric_scattering(norm, density, rcs, rays_p, t_vals, dirs, pulse_bins, near_range, wavelength):
-    """Volumetric Rendering Function.
 
-    Args:
-    norm: torch.tensor(float32), normal values, [batch_size, ray_batch_size, num_samples, 3]
-    density: torch.tensor(float32), density, [batch_size, ray_batch_size, num_samples].
-    t_vals: torch.tensor(float32), [batch_size, ray_batch_size, num_samples].
-    dirs: torch.tensor(float32), [batch_size, ray_batch_size, 3].
-    pulse_bins: torch.tensor(float32), [pulse_length]
 
-    Returns:
-    pulse: torch.tensor(float32), [batch_size, pulse_length, 2].
-    disp: torch.tensor(float32), [batch_size, ray_batch_size].
-    acc: torch.tensor(float32), [batch_size, ray_batch_size].
-    weights: torch.tensor(float32), [batch_size, num_samples]
+
+def generate_spiral_cam_to_world(radii, focus_depth, n_poses=120):
     """
-    t_mids = 0.5 * (t_vals[..., :-1] + t_vals[..., 1:])
-    t_dists = t_vals[..., 1:] - t_vals[..., :-1]
-    delta = t_dists * torch.linalg.norm(dirs[..., None, :], dim=-1)
-    density_delta = density[..., 0] * delta
+    Generate a spiral path for rendering
+    ref: https://github.com/kwea123/nerf_pl/blob/master/datasets/llff.py
+    Computes poses that follow a spiral path for rendering purpose.
+    See https://github.com/Fyusion/LLFF/issues/19
+    In particular, the path looks like:
+    https://tinyurl.com/ppn7ddat
+    Inputs:
+        radii: (3) radii of the spiral for each axis
+        focus_depth: float, the depth that the spiral poses look at
+        n_poses: int, number of poses to create along the path
+    Outputs:
+        poses_spiral: (n_poses, 3, 4) the cam to world transformation matrix of a spiral path
+    """
 
-    alpha = 1 - torch.exp(-density_delta)
-    trans = torch.exp(-torch.cat([
-        torch.zeros_like(density_delta[..., :1]),
-        torch.cumsum(density_delta[..., :-1], dim=-1)
-    ], dim=-1))
-    weights = alpha * trans
-
-    comp_norm = (weights[..., None] * norm).sum(dim=-2)
-    comp_norm = comp_norm / torch.linalg.norm(comp_norm, dim=-1)[..., None]
-    comp_rcs = (weights[..., None] * rcs).sum(dim=-2)
-    acc = weights.sum(dim=-1)
-    distance = (weights * t_mids).sum(dim=-1) / acc
-    distance = (torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1]) *
-                (pulse_bins[1] - pulse_bins[0]) + near_range)
-    # Apply Phong reflection model to get reflected power
-    bounce = comp_norm * torch.sum(dirs * comp_norm, dim=-1)[..., None] * 2 - dirs
-    nrho = rays_p * (torch.sum(dirs * comp_norm, dim=-1) * comp_rcs[..., 0] +
-                     torch.nan_to_num(torch.abs(torch.sum(bounce * comp_norm, dim=-1) *
-                                                comp_rcs[..., 1])**comp_rcs[..., 2])) / distance**2
-    # Calculate out expected phase as well
-    ret = torch.view_as_real(nrho * torch.exp(-2j * torch.pi / wavelength * distance * 2))
-    pulse = torch.zeros((nrho.shape[0], pulse_bins.shape[0], 2), dtype=torch.float, device=nrho.device)
-    # Place into correct range bins
-    for d in range(nrho.shape[0]):
-        pulse[d, torch.bucketize(distance[d], pulse_bins.to(distance.device))] += ret[d]
-    return pulse, distance, acc, weights, alpha
+    spiral_cams = []
+    for t in np.linspace(0, 4 * np.pi, n_poses + 1)[:-1]:  # rotate 4pi (2 rounds)
+        # the parametric function of the spiral (see the interactive web)
+        center = np.array([(np.cos(t) * 0.5) - 2, -np.sin(t) - 0.5, -np.sin(0.5 * t) * 0.75]) * radii
+        # the viewing z axis is the vector pointing from the focus_depth plane to center
+        z = normalize(center - np.array([0, 0, -focus_depth]))
+        # compute other axes as in average_poses
+        x = normalize(np.cross(np.array([0, 1, 0]), z))
+        y = np.cross(z, x)
+        spiral_cams += [np.stack([y, z, x, center], 1)]
+    return np.stack(spiral_cams, 0)
 
 
-trans_t = lambda t: torch.Tensor([
-    [1, 0, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, t],
-    [0, 0, 0, 1]]).float()
+def generate_spherical_cam_to_world(radius, n_poses=120):
+    """
+    Generate a 360 degree spherical path for rendering
+    ref: https://github.com/kwea123/nerf_pl/blob/master/datasets/llff.py
+    ref: https://github.com/yenchenlin/nerf-pytorch/blob/master/load_blender.py
+    Create circular poses around z axis.
+    Inputs:
+        radius: the (negative) height and the radius of the circle.
+    Outputs:
+        spheric_cams: (n_poses, 3, 4) the cam to world transformation matrix of a circular path
+    """
 
-rot_tran_roll = lambda phi: torch.Tensor([
-    [1, 0, 0, 0],
-    [0, np.cos(phi), -np.sin(phi), 0],
-    [0, np.sin(phi), np.cos(phi), 0],
-    [0, 0, 0, 1]]).float()
+    def spheric_pose(theta, phi, radius):
+        trans_t = lambda t: np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, t],
+            [0, 0, 0, 1],
+        ], dtype=np.float)
 
-rot_tran_pitch = lambda th: torch.Tensor([
-    [np.cos(th), 0, -np.sin(th), 0],
-    [0, 1, 0, 0],
-    [np.sin(th), 0, np.cos(th), 0],
-    [0, 0, 0, 1]]).float()
+        rotation_phi = lambda phi: np.array([
+            [1, 0, 0, 0],
+            [0, np.cos(phi), -np.sin(phi), 0],
+            [0, np.sin(phi), np.cos(phi), 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float)
 
-rot_tran_yaw = lambda th: torch.Tensor([
-    [np.cos(th), -np.sin(th), 0, 0],
-    [np.sin(th), np.cos(th), 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1]]).float()
+        rotation_theta = lambda th: np.array([
+            [np.cos(th), 0, -np.sin(th), 0],
+            [0, 1, 0, 0],
+            [np.sin(th), 0, np.cos(th), 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float)
+        cam_to_world = trans_t(radius)
+        cam_to_world = rotation_phi(phi / 180. * np.pi) @ cam_to_world
+        cam_to_world = rotation_theta(theta) @ cam_to_world
+        cam_to_world = np.array([[-1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
+                                dtype=np.float) @ cam_to_world
+        return cam_to_world
 
-rot_roll = lambda phi: torch.Tensor([
-    [1, 0, 0],
-    [0, np.cos(phi), -np.sin(phi)],
-    [0, np.sin(phi), np.cos(phi)]]).float()
-
-rot_pitch = lambda th: torch.Tensor([
-    [np.cos(th), 0, -np.sin(th)],
-    [0, 1, 0],
-    [np.sin(th), 0, np.cos(th)]]).float()
-
-rot_yaw = lambda th: torch.Tensor([
-    [np.cos(th), -np.sin(th), 0],
-    [np.sin(th), np.cos(th), 0],
-    [0, 0, 1]]).float()
-
-def pose_spherical(theta, phi, radius):
-    c2w = trans_t(radius)
-    c2w = rot_tran_roll(phi / 180. * np.pi) @ c2w
-    c2w = rot_tran_pitch(theta / 180. * np.pi) @ c2w
-    c2w = torch.Tensor(np.array([[-1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])) @ c2w
-    return c2w
-
-
-def load_blender_data(basedir, testskip=1):
-    all_imgs = []
-    all_poses = []
-    with open(os.path.join(basedir, 'transforms_train.json'), 'r') as fp:
-        meta = json.load(fp)
-    if testskip == 0:
-        skip = 1
-    else:
-        skip = testskip
-
-    for frame in meta['frames'][::skip]:
-        fname = os.path.join(basedir, f"{frame['file_path']}.png")
-        all_imgs.append(imageio.v2.imread(fname))
-        all_poses.append(np.array(frame['transform_matrix']))
-
-    imgs = np.array(all_imgs).astype(np.float32) / 255
-    poses = np.array(all_poses).astype(np.float32)
-
-    # render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180, 180, 40 + 1)[:-1]], 0)
-
-    return imgs, poses# , render_poses
-
-
-def get_blender_params(basedir):
-    with open(os.path.join(basedir, 'transforms_train.json'), 'r') as fp:
-        meta = json.load(fp)
-
-    frame = meta['frames'][0]
-    image = imageio.v2.imread(os.path.join(basedir, f"{frame['file_path']}.png"))
-    H, W = image.shape[:2]
-    camera_angle_x = float(meta['camera_angle_x'])
-    focal = .5 * W / np.tan(.5 * camera_angle_x)
-    return H, W, focal
-
-
-def load_llff_data(basedir, factor):
-    """Load data from disk"""
-    img_dir = 'images'
-    if factor != 1:
-        img_dir = 'images_' + str(factor)
-    img_dir = os.path.join(basedir, img_dir)
-    img_files = [
-        os.path.join(img_dir, f)
-        for f in sorted(os.listdir(img_dir))
-        if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')
-    ]
-    images = []
-    for img_file in img_files:
-        image = imageio.v2.imread(img_file)
-        images.append(image)
-    images = np.stack(images, -1)
-
-    # Load poses
-    with open(os.path.join(basedir, 'poses_bounds.npy'), 'rb') as fp:
-        poses_arr = np.load(fp)
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0])
-    bds = poses_arr[:, -2:].transpose([1, 0])
-    # Update poses according to downsampling.
-    poses[:2, 4, :] = np.array(images.shape[:2]).reshape([2, 1])
-    poses[2, 4, :] = poses[2, 4, :] * 1. / factor
-    # Correct rotation matrix ordering and move variable dim to axis 0.
-    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    images = np.moveaxis(images, -1, 0)
-    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
-    # Rescale according to a default bd factor.
-    scale = 1. / (bds.min() * .75)
-    poses[:, :3, 3] *= scale
-    bds *= scale
-    # Recenter poses.
-    poses = recenter_poses(poses)
-    return images, poses
-
-
-def get_llff_params(basedir, factor):
-    """Load data from disk"""
-    img_dir = 'images'
-    if factor != 1:
-        img_dir = 'images_' + str(factor)
-    img_dir = os.path.join(basedir, img_dir)
-    img_files = [
-        os.path.join(img_dir, f)
-        for f in sorted(os.listdir(img_dir))
-        if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')
-    ]
-    images = []
-    for img_file in img_files:
-        image = imageio.v2.imread(img_file)
-        images.append(image)
-    images = np.stack(images, -1)
-
-    # Load poses
-    with open(os.path.join(basedir, 'poses_bounds.npy'), 'rb') as fp:
-        poses_arr = np.load(fp)
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0])
-    bds = poses_arr[:, -2:].transpose([1, 0])
-    # Update poses according to downsampling.
-    poses[:2, 4, :] = np.array(images.shape[:2]).reshape([2, 1])
-    poses[2, 4, :] = poses[2, 4, :] * 1. / factor
-    # Correct rotation matrix ordering and move variable dim to axis 0.
-    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    images = np.moveaxis(images, -1, 0)
-    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
-    # Rescale according to a default bd factor.
-    scale = 1. / (bds.min() * .75)
-    poses[:, :3, 3] *= scale
-    bds *= scale
-    # Recenter poses.
-    poses = recenter_poses(poses)
-    return images[0].shape[0], images[0].shape[1], poses[0, -1, -1]
+    spheric_cams = []
+    for th in np.linspace(0, 2 * np.pi, n_poses + 1)[:-1]:
+        spheric_cams += [spheric_pose(th, -30, radius)]
+    return np.stack(spheric_cams, 0)
 
 
 def recenter_poses(poses):
@@ -583,7 +432,137 @@ def look_at(z, up, pos):
     return m
 
 
+def flatten(x):
+    # Always flatten out the height x width dimensions
+    x = [y.reshape([-1, y.shape[-1]]) for y in x]
+    # concatenate all data into one list
+    x = np.concatenate(x, axis=0)
+    return x
+
 
 def normalize(x):
     """Normalization helper function."""
     return x / np.linalg.norm(x)
+
+
+def convolve2d(z, f):
+  return signal.convolve2d(z, f, mode='same')
+
+
+def depth_to_normals(depth):
+    """Assuming `depth` is orthographic, linearize it to a set of normals."""
+    f_blur = np.array([1, 2, 1]) / 4
+    f_edge = np.array([-1, 0, 1]) / 2
+    dy = convolve2d(depth, f_blur[None, :] * f_edge[:, None])
+    dx = convolve2d(depth, f_blur[:, None] * f_edge[None, :])
+    inv_denom = 1 / np.sqrt(1 + dx**2 + dy**2)
+    normals = np.stack([dx * inv_denom, dy * inv_denom, inv_denom], -1)
+    return normals
+
+
+def sinebow(h):
+    """A cyclic and uniform colormap, see http://basecase.org/env/on-rainbows."""
+    f = lambda x: np.sin(np.pi * x)**2
+    return np.stack([f(3 / 6 - h), f(5 / 6 - h), f(7 / 6 - h)], -1)
+
+
+def visualize_normals(depth, acc, scaling=None):
+    """Visualize fake normals of `depth` (optionally scaled to be isotropic)."""
+    if scaling is None:
+        mask = ~np.isnan(depth)
+        x, y = np.meshgrid(
+            np.arange(depth.shape[1]), np.arange(depth.shape[0]), indexing='xy')
+        xy_var = (np.var(x[mask]) + np.var(y[mask])) / 2
+        z_var = np.var(depth[mask])
+        scaling = np.sqrt(xy_var / z_var)
+
+        scaled_depth = scaling * depth
+        normals = depth_to_normals(scaled_depth)
+        vis = np.isnan(normals) + np.nan_to_num((normals + 1) / 2, 0)
+
+        # Set non-accumulated pixels to white.
+        if acc is not None:
+            vis = vis * acc[:, :, None] + (1 - acc)[:, :, None]
+
+        return vis
+
+
+def visualize_depth(depth,
+                    acc=None,
+                    near=None,
+                    far=None,
+                    ignore_frac=0,
+                    curve_fn=lambda x: -np.log(x + np.finfo(np.float32).eps),
+                    modulus=0,
+                    colormap=None):
+    """Visualize a depth map.
+    Args:
+      depth: A depth map.
+      acc: An accumulation map, in [0, 1].
+      near: The depth of the near plane, if None then just use the min().
+      far: The depth of the far plane, if None then just use the max().
+      ignore_frac: What fraction of the depth map to ignore when automatically
+        generating `near` and `far`. Depends on `acc` as well as `depth'.
+      curve_fn: A curve function that gets applied to `depth`, `near`, and `far`
+        before the rest of visualization. Good choices: x, 1/(x+eps), log(x+eps).
+          Note that the default choice will flip the sign of depths, so that the
+          default colormap (turbo) renders "near" as red and "far" as blue.
+      modulus: If > 0, mod the normalized depth by `modulus`. Use (0, 1].
+      colormap: A colormap function. If None (default), will be set to
+        matplotlib's turbo if modulus==0, sinebow otherwise.
+    Returns:
+      An RGB visualization of `depth`.
+    """
+    if acc is None:
+        acc = np.ones_like(depth)
+    acc = np.where(np.isnan(depth), np.zeros_like(acc), acc)
+
+    # Sort `depth` and `acc` according to `depth`, then identify the depth values
+    # that span the middle of `acc`, ignoring `ignore_frac` fraction of `acc`.
+    sortidx = np.argsort(depth.reshape([-1]))
+    depth_sorted = depth.reshape([-1])[sortidx]
+    acc_sorted = acc.reshape([-1])[sortidx]
+    cum_acc_sorted = np.cumsum(acc_sorted)
+    mask = ((cum_acc_sorted >= cum_acc_sorted[-1] * ignore_frac) &
+            (cum_acc_sorted <= cum_acc_sorted[-1] * (1 - ignore_frac)))
+    depth_keep = depth_sorted[mask]
+
+    # If `near` or `far` are None, use the highest and lowest non-NaN values in
+    # `depth_keep` as automatic near/far planes.
+    eps = np.finfo(np.float32).eps
+    near = near or depth_keep[0] - eps
+    far = far or depth_keep[-1] + eps
+
+    # Curve all values.
+    depth, near, far = [curve_fn(x) for x in [depth, near, far]]
+
+    # Wrap the values around if requested.
+    if modulus > 0:
+        value = np.mod(depth, modulus) / modulus
+        colormap = colormap or sinebow
+    else:
+        # Scale to [0, 1].
+        value = np.nan_to_num(
+            np.clip((depth - np.minimum(near, far)) / np.abs(far - near), 0, 1))
+        colormap = colormap or cm.get_cmap('turbo')
+
+    vis = colormap(value)[:, :, :3]
+
+    # Set non-accumulated pixels to white.
+    vis = vis * acc[:, :, None] + (1 - acc)[:, :, None]
+
+    return vis
+
+
+def to8b(img):
+    if len(img.shape) >= 3:
+        return np.array([to8b(i) for i in img])
+    else:
+        return (255 * np.clip(np.nan_to_num(img), 0, 1)).astype(np.uint8)
+
+
+def to_float(img):
+    if len(img.shape) >= 3:
+        return np.array([to_float(i) for i in img])
+    else:
+        return (img / 255.).astype(np.float32)

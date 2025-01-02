@@ -1,67 +1,81 @@
 # For original NeRF
-exp_params:
-  learn_params:
-    LR: 0.0005
-    weight_decay: 0.1
-    scheduler_gamma: 0.9
-    coarse_weight_decay: 0.1
-    swa_start: .6
-    betas: [ .9, .99 ]
-    step_size: 1
-  model_params:
-    D: 8
-    hidden: 256
+nerf_params:
+  # basic hyperparams to specify where to load/save data from/to
+  basic:
+    log_dir: logs
+    dataset_name: blender
+    scene: lego
+  # model hyperparams
+  model:
+    use_viewdirs: False
     randomized: False
-    ray_shape: cone
+    ray_shape: cone  # should be "cylinder" if llff
+    white_bkgd: False  # should be False if using llff
+    override_defaults: True
     num_levels: 2
     num_samples: 128
-    density_noise: 1
-    density_bias: -1
+    hidden: 256
+    density_noise: 0.0
+    density_bias: -1.0
     rgb_padding: 0.001
     resample_padding: 0.01
     min_deg: 0
     max_deg: 16
-    return_raw: False
-  train_params:
-    warm_start: False
-    log_epoch: 100
-    is_tuning: False
-    save_model: True
-    loss_landscape: False
-    patience: 500
-    max_epochs: 1000
-    log_dir: ./logs
-  dataset_params:
-    data_path: ./data/nerf_synthetic/nerf_synthetic/lego
-    train_batch_size: 256
-    val_batch_size: 256
-    near: 0.
-    far: 1.
-    num_workers: 0
-    pin_memory: False
-    split: .7
-    collate: False
+    viewdirs_min_deg: 0
+    viewdirs_max_deg: 4
+  # loss and optimizer hyperparams
+  loss:
+    coarse_weight_decay: 0.1
+    lr_init: .001
+    lr_final: .00005
+    lr_delay_steps: 2500
+    lr_delay_mult: 0.1
+    weight_decay: .00001
+  # training hyperparams
+  training:
+    factor: 2
+    max_steps: 2500
+    batch_size: 2048
+    do_eval: False
+    continue_training: True
+    save_every: 1000
+    device: cuda
+  # visualization hyperparams
+  visualization:
+    chunks: 8192
+    model_weight_path: log/model.pt
+    visualize_depth: True
+    visualize_normals: True
+  # extracting mesh hyperparams
+  mesh:
+    x_range: [-1.2, 1.2]
+    y_range: [-1.2, 1.2]
+    z_range: [-1.2, 1.2]
+    grid_size: 256
+    sigma_threshold: 50.0
+    occ_threshold: 0.2
 
 
 # For SARNeRF
 sar_exp_params:
   learn_params:
-    LR: 0.01
-    weight_decay: 0.01
+    LR: 0.001
+    LR_final: .00005
+    weight_decay: 0.00001
     scheduler_gamma: 0.9
     coarse_weight_decay: 0.1
     swa_start: .6
     betas: [ .9, .99 ]
     step_size: 1
   model_params:
-    D: 4
+    D: 2
     hidden: 256
-    randomized: False
+    randomized: True
     ray_shape: cone
     num_levels: 1
-    num_samples: 64
-    density_noise: 1
-    density_bias: -1
+    num_samples: 1024
+    density_noise: .001
+    density_bias: -1.
     rgb_padding: 0.001
     resample_padding: 0.01
     min_deg: 0
@@ -75,7 +89,7 @@ sar_exp_params:
     save_model: True
     loss_landscape: False
     patience: 500
-    max_epochs: 1000
+    max_epochs: 2000
     log_dir: ./logs
   dataset_params:
     data_path: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_113146.sar
@@ -83,8 +97,8 @@ sar_exp_params:
     train_batch_size: 1
     val_batch_size: 1
     fft_sz: 8192
-    az_samples: 32
-    el_samples: 32
+    az_samples: 16
+    el_samples: 16
     num_workers: 0
     pin_memory: False
     split: .7

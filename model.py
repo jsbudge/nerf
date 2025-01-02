@@ -2,132 +2,114 @@ import contextlib
 import pickle
 from typing import Optional, Union, Tuple, Dict
 import torch
-from torch import nn, Tensor
+import torch.nn as nn
+from torch import optim
+
+from utils import sample_along_rays, resample_along_rays, volumetric_rendering, namedtuple_map, to8b
 from pytorch_lightning import LightningModule
-from torch.nn import functional as nn_func
+from util_modules import PositionalEncoding, MipLRDecay, NeRFLoss
 from tqdm import tqdm
 import mcubes
 import numpy as np
-from utils import sample_along_rays, resample_along_rays, volumetric_rendering, rays_from_pose, volumetric_scattering
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
-to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 c0 = 299792458.0
 DTR = np.pi / 180
 
 
-class PositionalEncoding(LightningModule):
-    def __init__(self, min_deg, max_deg):
-        super(PositionalEncoding, self).__init__()
-        self.min_deg = min_deg
-        self.max_deg = max_deg
-        self.scales = nn.Parameter(torch.tensor([2 ** i for i in range(min_deg, max_deg)]), requires_grad=False)
-
-    def forward(self, x, y=None):
-        shape = list(x.shape[:-1]) + [-1]
-        x_enc = (x[..., None, :] * self.scales[:, None]).reshape(shape)
-        x_enc = torch.cat((x_enc, x_enc + 0.5 * torch.pi), -1)
-        if y is not None:
-            # IPE
-            y_enc = (y[..., None, :] * self.scales[:, None]**2).reshape(shape)
-            y_enc = torch.cat((y_enc, y_enc), -1)
-            x_ret = torch.exp(-0.5 * y_enc) * torch.sin(x_enc)
-            y_ret = torch.maximum(torch.zeros_like(y_enc), 0.5 * (1 - torch.exp(-2 * y_enc) * torch.cos(2 * x_enc)) - x_ret ** 2)
-            return x_ret, y_ret
-        else:
-            # PE
-            x_ret = torch.sin(x_enc)
-            return x_ret
 
 
-# Model
-class NeRF(LightningModule):
-    def __init__(self, D=8, hidden=256,
-                 randomized=False,
-                 ray_shape="cone",
-                 num_levels=2,
-                 num_samples=128,
-                 density_noise=1,
-                 density_bias=-1,
-                 rgb_padding=0.001,
-                 resample_padding=0.01,
-                 min_deg=0,
-                 max_deg=16,
+
+class MipNeRF(LightningModule):
+    def __init__(self,
+                 config=None,
                  return_raw=False,
-                 learn_params=None):
-        """
-        """
-        super(NeRF, self).__init__()
-        self.randomized = randomized
-        self.ray_shape = ray_shape
-        self.num_levels = num_levels
-        self.num_samples = num_samples
-        self.density_noise = density_noise
-        self.density_bias = density_bias
-        self.rgb_padding = rgb_padding
-        self.resample_padding = resample_padding
-        self.min_deg = min_deg
-        self.max_deg = max_deg
+                 ):
+        super(MipNeRF, self).__init__()
+        self.config = config
+        self.use_viewdirs = config.use_viewdirs
+        self.init_randomized = config.randomized
+        self.randomized = config.randomized
+        self.ray_shape = config.ray_shape
+        self.white_bkgd = config.white_bkgd
+        self.num_levels = config.num_levels
+        self.num_samples = config.num_samples
+        self.density_input = (config.max_deg - config.min_deg) * 3 * 2
+        self.rgb_input = 3 + ((config.viewdirs_max_deg - config.viewdirs_min_deg) * 3 * 2)
+        self.density_noise = config.density_noise
+        self.rgb_padding = config.rgb_padding
+        self.resample_padding = config.resample_padding
+        self.density_bias = config.density_bias
+        self.hidden = config.hidden
         self.return_raw = return_raw
-        self.params = learn_params
         self.automatic_optimization = False
-        self.input_ch = int((max_deg - min_deg) * 2 * 3)
         self.density_activation = nn.Softplus()
-        self.hidden = hidden
-        self.white_bkgd = False
-        self.encoding = PositionalEncoding(min_deg, max_deg)
 
-        net0 = [nn.Sequential(
-            nn.Linear(self.input_ch, self.hidden),
-            nn.GELU(),
-        )]
-        net0 = net0 + [nn.Sequential(
-            nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
-        ) for _ in range(D)]
+        self.loss_function = NeRFLoss(config.coarse_weight_decay)
 
-        self.density_net0 = nn.Sequential(*net0)
-
-        net1 = [nn.Sequential(
-            nn.Linear(self.input_ch + self.hidden, self.hidden),
-            nn.GELU(),
-        )]
-        net1 = net1 + [nn.Sequential(
-            nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
-        ) for _ in range(D)]
-
-        self.density_net1 = nn.Sequential(*net1)
-
+        self.positional_encoding = PositionalEncoding(config.min_deg, config.max_deg)
+        self.density_net0 = nn.Sequential(
+            nn.Linear(self.density_input, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+        )
+        self.density_net1 = nn.Sequential(
+            nn.Linear(self.density_input + config.hidden, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+            nn.Linear(config.hidden, config.hidden),
+            nn.ReLU(True),
+        )
         self.final_density = nn.Sequential(
-            nn.Linear(self.hidden, 1),
+            nn.Linear(config.hidden, 1),
         )
 
+        input_shape = config.hidden
+        if self.use_viewdirs:
+            input_shape = config.num_samples
+
+            self.rgb_net0 = nn.Sequential(
+                nn.Linear(config.hidden, config.hidden)
+            )
+            self.viewdirs_encoding = PositionalEncoding(config.viewdirs_min_deg, config.viewdirs_max_deg)
+            self.rgb_net1 = nn.Sequential(
+                nn.Linear(config.hidden + self.rgb_input, config.num_samples),
+                nn.ReLU(True),
+            )
         self.final_rgb = nn.Sequential(
-            nn.Linear(self.hidden, 3),
+            nn.Linear(input_shape, 3),
             nn.Sigmoid()
         )
+        _xavier_init(self)
 
-    def forward(self, rays_o, rays_d, radii, near, far):
+    def forward(self, rays):
         comp_rgbs = []
         distances = []
         accs = []
         for l in range(self.num_levels):
             # sample
             if l == 0:  # coarse grain sample
-                t_vals, (mean, var) = sample_along_rays(rays_o, rays_d, radii, self.num_samples,
-                                                        near, far, randomized=self.randomized, lindisp=False,
+                t_vals, (mean, var) = sample_along_rays(rays.origins, rays.directions, rays.radii, self.num_samples,
+                                                        rays.near, rays.far, randomized=self.randomized, lindisp=False,
                                                         ray_shape=self.ray_shape)
             else:  # fine grain sample/s
-                t_vals, (mean, var) = resample_along_rays(rays_o, rays_d, radii,
-                                                          t_vals.to(self.device),
-                                                          weights.to(self.device), randomized=self.randomized,
+                t_vals, (mean, var) = resample_along_rays(rays.origins, rays.directions, rays.radii,
+                                                          t_vals.to(rays.origins.device),
+                                                          weights.to(rays.origins.device), randomized=self.randomized,
                                                           stop_grad=True, resample_padding=self.resample_padding,
                                                           ray_shape=self.ray_shape)
             # do integrated positional encoding of samples
-            samples_enc = self.encoding(mean, var)[0]
+            samples_enc = self.positional_encoding(mean, var)[0]
             samples_enc = samples_enc.reshape([-1, samples_enc.shape[-1]])
 
             # predict density
@@ -135,102 +117,53 @@ class NeRF(LightningModule):
             new_encodings = torch.cat((new_encodings, samples_enc), -1)
             new_encodings = self.density_net1(new_encodings)
             raw_density = self.final_density(new_encodings).reshape((-1, self.num_samples, 1))
+
+            # predict rgb
+            if self.use_viewdirs:
+                #  do positional encoding of viewdirs
+                viewdirs = self.viewdirs_encoding(rays.viewdirs.to(self.device))
+                viewdirs = torch.cat((viewdirs, rays.viewdirs.to(self.device)), -1)
+                viewdirs = torch.tile(viewdirs[:, None, :], (1, self.num_samples, 1))
+                viewdirs = viewdirs.reshape((-1, viewdirs.shape[-1]))
+                new_encodings = self.rgb_net0(new_encodings)
+                new_encodings = torch.cat((new_encodings, viewdirs), -1)
+                new_encodings = self.rgb_net1(new_encodings)
             raw_rgb = self.final_rgb(new_encodings).reshape((-1, self.num_samples, 3))
 
             # Add noise to regularize the density predictions if needed.
             if self.randomized and self.density_noise:
-                raw_density += self.density_noise * torch.rand(raw_density.shape, dtype=raw_density.dtype,
-                                                               device=self.device)
+                raw_density += self.density_noise * torch.rand(raw_density.shape, dtype=raw_density.dtype, device=raw_density.device)
 
             # volumetric rendering
-            raw_rgb = raw_rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
-            raw_density = self.density_activation(raw_density + self.density_bias)
-            comp_rgb, distance, acc, weights, alpha = volumetric_rendering(raw_rgb, raw_density, t_vals,
-                                                                           rays_d,
-                                                                           self.white_bkgd)
+            rgb = raw_rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+            density = self.density_activation(raw_density + self.density_bias)
+            comp_rgb, distance, acc, weights, alpha = volumetric_rendering(rgb, density, t_vals, rays.directions.to(rgb.device), self.white_bkgd)
             comp_rgbs.append(comp_rgb)
             distances.append(distance)
             accs.append(acc)
         if self.return_raw:
-            raws = torch.cat((torch.clone(raw_rgb).detach(), torch.clone(raw_density).detach()), -1).cpu()
+            raws = torch.cat((torch.clone(rgb).detach(), torch.clone(density).detach()), -1).cpu()
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
             return torch.stack(comp_rgbs), torch.stack(distances), torch.stack(accs), raws
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
             return torch.stack(comp_rgbs), torch.stack(distances), torch.stack(accs)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(),
-                                lr=self.params['LR'],
-                                weight_decay=self.params['weight_decay'],
-                                betas=self.params['betas'],
-                                eps=1e-7)
-        if self.params['scheduler_gamma'] is None:
-            return optimizer
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.params['scheduler_gamma'], verbose=True)
-        '''scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, cooldown=self.params['step_size'],
-                                                         factor=self.params['scheduler_gamma'], threshold=1e-5)'''
-
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
-
-    def training_step(self, batch, batch_idx):
-        opt = self.optimizers()
-        train_loss = self.train_val_get(batch, batch_idx)
-        opt.zero_grad()
-        self.manual_backward(train_loss)
-        opt.step()
-
-    def validation_step(self, batch, batch_idx):
-        self.train_val_get(batch, batch_idx, 'val')
-
-    def on_validation_epoch_end(self) -> None:
-        sch = self.lr_schedulers()
-
-        # If the selected scheduler is a ReduceLROnPlateau scheduler.
-        if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            sch.step(self.trainer.callback_metrics["val_loss"])
-        else:
-            sch.step()
-        self.log('LR', sch.get_last_lr()[0], prog_bar=True, rank_zero_only=True)
-
-    def train_val_get(self, batch, batch_idx, kind='train'):
-        rays_o, rays_d, radii, near, far, target = batch
-
-        # Generate rays for random sampling
-        rgb, disp, acc = self.forward(rays_o, rays_d, radii, near, far)
-
-        train_loss, psnrs = self.loss_function(rgb, target)
-
-        self.log_dict({f'{kind}_loss': train_loss}, on_epoch=True,
-                      prog_bar=True, rank_zero_only=True)
-        return train_loss
-
-    def loss_function(self, input, target):
-        losses = []
-        psnrs = []
-        for rgb in input:
-            mse = ((rgb - target[..., :3]) ** 2).mean()
-            losses.append(mse)
-            with torch.no_grad():
-                psnrs.append(mse_to_psnr(mse))
-        losses = torch.stack(losses)
-        loss = self.params['coarse_weight_decay'] * torch.sum(losses[:-1]) + losses[-1]
-        return loss, torch.Tensor(psnrs)
-
-    def render_image(self, pose, height, width, focal, chunks=1024):
+    def render_image(self, rays, height, width, chunks=8192):
         """
         Return image, disparity map, accumulated opacity (shaped to height x width) created using rays as input.
         Rays should be all of the rays that correspond to this one single image.
         Batches the rays into chunks to not overload memory of device
         """
+        length = rays[0].shape[0]
         rgbs = []
         dists = []
         accs = []
-        rays_d, rays_o, radii, near, far = rays_from_pose(width, height, focal, pose, 0., 1.)
         with torch.no_grad():
-            for i in range(0, rays_o.shape[0], chunks):
-                rgb, distance, acc = self(rays_o[i:i + chunks], rays_d[i:i + chunks], radii[i:i + chunks],
-                                          near[i:i + chunks], far[i:i + chunks])
+            for i in range(0, length, chunks):
+                # put chunk of rays on device
+                chunk_rays = namedtuple_map(lambda r: r[i:i+chunks].to(self.device), rays)
+                rgb, distance, acc = self(chunk_rays)
                 rgbs.append(rgb[-1].cpu())
                 dists.append(distance[-1].cpu())
                 accs.append(acc[-1].cpu())
@@ -240,37 +173,55 @@ class NeRF(LightningModule):
         accs = torch.cat(accs, dim=0).reshape(height, width).numpy()
         return rgbs, dists, accs
 
-    def render_model(self, xrange: tuple[float, float], yrange: tuple[float, float], zrange: tuple[float, float],
-                     xpts: int = 400, ypts: int = 400, zpts: int = 100, sigma_threshold: float = 50.,
-                     chunks: int = 1024):
-        """
-        Return image, disparity map, accumulated opacity (shaped to height x width) created using rays as input.
-        Rays should be all of the rays that correspond to this one single image.
-        Batches the rays into chunks to not overload memory of device
-        """
-        self.return_raw = True
-        x, y, z = np.meshgrid(np.linspace(xrange[0], xrange[1], xpts), np.linspace(yrange[0], yrange[1], ypts),
-                              np.linspace(zrange[0], zrange[1], zpts))
-        rays_o = torch.FloatTensor(np.stack([x, y, z], -1).reshape(-1, 3)).to(self.device)
-        rays_d = torch.zeros_like(rays_o).to(self.device)
-        radii = torch.ones_like(rays_o[..., :1]).to(self.device) * 0.0005
-        near = torch.ones_like(radii).to(self.device)
-        far = torch.ones_like(radii).to(self.device)
-        raws = []
-        with torch.no_grad():
-            for i in tqdm(range(0, rays_o.shape[0], chunks)):
-                _, _, _, raw = self(rays_o[i:i + chunks], rays_d[i:i + chunks], radii[i:i + chunks],
-                                          near[i:i + chunks], far[i:i + chunks])
-                raws.append(torch.mean(raw, dim=1).cpu())
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(), lr=self.config.lr_init, weight_decay=self.config.weight_decay)
+        scheduler = MipLRDecay(optimizer, lr_init=self.config.lr_init, lr_final=self.config.lr_final,
+                               max_steps=self.config.max_steps, lr_delay_steps=self.config.lr_delay_steps,
+                               lr_delay_mult=self.config.lr_delay_mult)
 
-        sigma = torch.cat(raws, dim=0)
-        sigma = np.maximum(sigma[:, -1].cpu().numpy(), 0)
-        sigma = sigma.reshape(x.shape)
-        print("Extracting mesh")
-        print("fraction occupied", np.mean(np.array(sigma > sigma_threshold), dtype=np.float32))
-        vertices, triangles = mcubes.marching_cubes(sigma, sigma_threshold)
-        mcubes.export_obj(vertices, triangles, 'render_output.obj')
-        return vertices, triangles
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+
+    def training_step(self, batch, batch_idx):
+        opt = self.optimizers()
+        train_loss = self.train_val_get(batch, batch_idx)
+        opt.zero_grad()
+        self.manual_backward(train_loss)
+        opt.step()
+        self.lr_schedulers().step()
+
+    def validation_step(self, batch, batch_idx):
+        self.train_val_get(batch, batch_idx, 'val')
+
+    def train_val_get(self, batch, batch_idx, kind='train'):
+        rays, pixels = batch
+
+        # Generate rays for random sampling
+        rgb, _, _ = self.forward(rays)
+
+        train_loss, psnrs = self.loss_function(rgb, pixels, rays.lossmult.to(self.device))
+
+        self.log_dict({f'{kind}_loss': train_loss, 'coarse_psnr': torch.mean(psnrs[:-1]), 'fine_psnr': psnrs[-1],
+                       'avg_psnr': torch.mean(psnrs), 'LR': self.lr_schedulers().get_last_lr()[0]}, on_epoch=True,
+                      prog_bar=True, rank_zero_only=True)
+        return train_loss
+
+    def train(self, mode=True):
+        self.randomized = self.init_randomized
+        super().train(mode)
+        return self
+
+    def eval(self):
+        self.randomized = False
+        return super().eval()
+
+
+def _xavier_init(model):
+    """
+    Performs the Xavier weight initialization.
+    """
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
 
 
 class SARNeRF(LightningModule):
@@ -313,22 +264,22 @@ class SARNeRF(LightningModule):
 
         net0 = [nn.Sequential(
             nn.Linear(self.input_ch, self.hidden),
-            nn.GELU(),
+            nn.ReLU(),
         )]
         net0 = net0 + [nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
+            nn.ReLU(),
         ) for _ in range(D)]
 
         self.density_net0 = nn.Sequential(*net0)
 
         net1 = [nn.Sequential(
             nn.Linear(self.input_ch + self.hidden, self.hidden),
-            nn.GELU(),
+            nn.ReLU(),
         )]
         net1 = net1 + [nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
+            nn.ReLU(),
         ) for _ in range(D)]
 
         self.density_net1 = nn.Sequential(*net1)
@@ -338,8 +289,8 @@ class SARNeRF(LightningModule):
         )
 
         self.final_norm = nn.Sequential(
-            nn.Linear(self.hidden, 3),
-            nn.Softsign()
+            nn.Linear(self.hidden, 2),
+            nn.Sigmoid()
         )
 
         self.final_rcs = nn.Sequential(
@@ -349,12 +300,12 @@ class SARNeRF(LightningModule):
 
         self.norm_net1 = nn.Sequential(
             nn.Linear(self.input_ch + self.hidden, self.hidden),
-            nn.GELU(),
+            nn.ReLU(),
         )
 
         self.norm_net0 = nn.Sequential(
-            nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
+            nn.Linear(self.input_ch, self.hidden),
+            nn.ReLU(),
         )
 
         _xavier_init(self)
@@ -363,9 +314,9 @@ class SARNeRF(LightningModule):
         comp_rgbs = []
         distances = []
         accs = []
-        scaling = _far - _near
-        near = torch.zeros_like(radii, device=self.device)
-        far = torch.ones_like(radii, device=self.device)
+        # scaling = _far - _near
+        near = torch.ones_like(radii, device=self.device) * _near
+        far = torch.ones_like(radii, device=self.device) * _far
 
         for l in range(self.num_levels):
             # sample
@@ -388,17 +339,19 @@ class SARNeRF(LightningModule):
             new_encodings = torch.cat((new_encodings, samples_enc), -1)
             new_encodings = self.density_net1(new_encodings)
             raw_density = self.final_density(new_encodings).reshape((-1, self.num_samples, 1))
-
-            new_encodings = self.norm_net0(new_encodings)
-            new_encodings = torch.cat((new_encodings, samples_enc), -1)
-            new_encodings = self.norm_net1(new_encodings)
-            raw_norms = self.final_norm(new_encodings).reshape((-1, radii.shape[1], self.num_samples, 3))
             raw_rcs = self.final_rcs(new_encodings).reshape((-1, radii.shape[-1], self.num_samples, 3))
+
+            norm_encodings = self.norm_net0(samples_enc)
+            norm_encodings = torch.cat((norm_encodings, samples_enc), -1)
+            norm_encodings = self.norm_net1(norm_encodings)
+            raw_norms = self.final_norm(norm_encodings).reshape((-1, radii.shape[1], self.num_samples, 2))
+
 
             # Add noise to regularize the density predictions if needed.
             if self.randomized and self.density_noise:
                 raw_density += self.density_noise * torch.rand(raw_density.shape, dtype=raw_density.dtype,
                                                                device=self.device)
+            raw_rcs = raw_rcs * (1 + 2 * self.rgb_padding) - self.rgb_padding
 
             # volumetric rendering
             raw_density = self.density_activation(raw_density + self.density_bias).reshape((-1, radii.shape[-1], self.num_samples, 1))
@@ -428,7 +381,7 @@ class SARNeRF(LightningModule):
                                 eps=1e-7)
         if self.params['scheduler_gamma'] is None:
             return optimizer
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.params['scheduler_gamma'], verbose=True)
+        scheduler = MipLRDecay(optimizer, lr_init=self.params['LR'], max_steps=200000, lr_final=self.params['LR_final'], lr_delay_steps=2500, lr_delay_mult=.1)
         '''scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, cooldown=self.params['step_size'],
                                                          factor=self.params['scheduler_gamma'], threshold=1e-5)'''
 
@@ -440,6 +393,7 @@ class SARNeRF(LightningModule):
         opt.zero_grad()
         self.manual_backward(train_loss)
         opt.step()
+        self.lr_schedulers().step()
 
     def validation_step(self, batch, batch_idx):
         self.train_val_get(batch, batch_idx, 'val')
@@ -450,9 +404,7 @@ class SARNeRF(LightningModule):
         # If the selected scheduler is a ReduceLROnPlateau scheduler.
         if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
             sch.step(self.trainer.callback_metrics["val_loss"])
-        else:
-            sch.step()
-        self.log('LR', sch.get_last_lr()[0], prog_bar=True, rank_zero_only=True)
+            self.log('LR', sch.get_last_lr()[0], prog_bar=True, rank_zero_only=True)
 
     def train_val_get(self, batch, batch_idx, kind='train'):
         rays_o, rays_d, rays_p, mfilt, radii, near, far, mpp, target = batch
@@ -462,7 +414,7 @@ class SARNeRF(LightningModule):
 
         train_loss = self.loss_function(rgb, target)
 
-        self.log_dict({f'{kind}_loss': train_loss}, on_epoch=True,
+        self.log_dict({f'{kind}_loss': train_loss, 'LR': self.lr_schedulers().get_last_lr()[0]}, on_epoch=True,
                       prog_bar=True, rank_zero_only=True)
         return train_loss
 
@@ -489,8 +441,8 @@ class SARNeRF(LightningModule):
         rays_o = torch.FloatTensor(np.stack([x, y, z], -1).reshape(-1, chunks, 3)).to(self.device)
         rays_d = torch.zeros_like(rays_o).to(self.device)
         radii = torch.ones_like(rays_o[..., 1]).to(self.device) * 0.0005
-        near = torch.ones_like(radii).to(self.device)
-        far = torch.ones_like(radii).to(self.device)
+        near = 0.
+        far = 1.
         rays_p = torch.ones_like(radii).to(self.device)
         mfilt = torch.ones((1, 8192)).to(self.device)
         mpp = torch.tensor([1.]).to(self.device)
@@ -502,7 +454,7 @@ class SARNeRF(LightningModule):
                 _, _, _, raw = self(rays_o[i].unsqueeze(0), rays_d[i].unsqueeze(0), rays_p[i].unsqueeze(0),
                                    mfilt,
                                    radii[i].unsqueeze(0),
-                                   near[i].unsqueeze(0), far[i].unsqueeze(0), 3062, mpp)
+                                   near, far, 3062, mpp)
                 raws.append(torch.mean(raw, dim=2).cpu())
         sigma = torch.cat(raws, dim=1)
         sigma = np.maximum(sigma[..., -1].cpu().numpy(), 0)
@@ -516,12 +468,3 @@ class SARNeRF(LightningModule):
 
 def mse_to_psnr(mse):
     return -10.0 * torch.log10(mse)
-
-
-def _xavier_init(model):
-    """
-    Performs the Xavier weight initialization.
-    """
-    for module in model.modules():
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
