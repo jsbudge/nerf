@@ -1,15 +1,16 @@
-import pickle
 import numpy as np
 import torch
 from pytorch_lightning import Trainer, loggers, seed_everything
-from pytorch_lightning.callbacks import EarlyStopping, StochasticWeightAveraging
-import yaml
 from sdrparse import load
 from simulib.platform_helper import SDRPlatform
 import plotly.express as px
 import plotly.io as pio
 import plotly.graph_objects as go
-from dataloader import SDRDataModule
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+from config import get_config
+from dataloader import SARNeRFModule
 from model import SARNeRF
 import matplotlib.pyplot as plt
 import open3d as o3d
@@ -35,53 +36,38 @@ if __name__ == '__main__':
     seed_everything(np.random.randint(1, 2048), workers=True)
     # seed_everything(17, workers=True)
 
-    with open('./params.yaml', 'r') as file:
-        try:
-            config = yaml.safe_load(file)
-        except yaml.YAMLError as exc:
-            print(exc)
+    config = get_config(model='sarnerf', param_file='./params.yaml')
 
-    exp_params = config['sar_exp_params']
     print('Loading data...')
-    data = SDRDataModule(device=device, pulse_std=exp_params['model_params']['pulse_std'], **exp_params["dataset_params"])
+    data = SARNeRFModule(config=config)
     data.setup()
-    logger = loggers.TensorBoardLogger(exp_params['train_params']['log_dir'],
-                                       name="SARNeRF", log_graph=True)
+    logger = loggers.TensorBoardLogger(config.log_dir, name="SARNeRF", log_graph=True)
+
+    print('Building trainer...')
+    trainer = Trainer(logger=logger, max_epochs=config.max_steps, devices=[0])
 
     print('Loading model...')
-    mdl = SARNeRF(**exp_params['model_params'], learn_params=exp_params['learn_params'])
-
-    expected_lr = max((exp_params['learn_params']['LR'] *
-                       exp_params['learn_params']['scheduler_gamma'] ** (
-                               exp_params['train_params']['max_epochs'] * exp_params['learn_params']['swa_start'])),
-                      1e-9)
-    print('Building trainer...')
-    trainer = Trainer(logger=logger, max_epochs=exp_params['train_params']['max_epochs'],
-                      log_every_n_steps=exp_params['train_params']['log_epoch'], devices=[1], callbacks=
-                      [EarlyStopping(monitor='train_loss', patience=exp_params['train_params']['patience'],
-                                     check_finite=True),
-                       StochasticWeightAveraging(swa_lrs=expected_lr,
-                                                 swa_epoch_start=exp_params['learn_params']['swa_start'])])
+    model = SARNeRF(
+        config=config,
+    )
+    model.train()
 
     print("======= Training =======")
     try:
-        trainer.fit(mdl, datamodule=data)
+        trainer.fit(model, datamodule=data)
     except KeyboardInterrupt:
         print('Breaking out of training early.')
+
+    torch.save(model.state_dict(), config.model_weight_path)
 
     rays_o, rays_d, rays_p, mfilt, radii, near, far, mpp, target = next(iter(data.train_dataloader()))
 
 
     print('Rendering pulse...')
-    with torch.no_grad():
-        pulse, disp, acc = mdl(rays_o.to(mdl.device), rays_d.to(mdl.device), rays_p.to(mdl.device),
-                               mfilt.to(mdl.device), radii.to(mdl.device), near.to(mdl.device), far.to(mdl.device),
-                               target.shape[1], mpp.to(mdl.device))
-
-        disp_np = disp.cpu().data.numpy()
-
-        verts, tris = mdl.render_model((-100., 100.), (-100., 100.), (-5., 10.), 100, 100, 100, sigma_threshold=50.,
-                                       chunks=1000)
+    model.eval()
+    pulse, disp, acc = model(rays_o.to(model.device), rays_d.to(model.device), rays_p.to(model.device),
+                             mfilt.to(model.device), radii.to(model.device), near.to(model.device),
+                             far.to(model.device), target.shape[1], mpp.to(model.device))
     np_pulse = pulse.cpu().data.numpy()
     np_target = target.cpu().data.numpy()
 
@@ -92,8 +78,8 @@ if __name__ == '__main__':
     plt.plot(np_target[0, :, 0])
     plt.show()
 
-    sdr_f = load(exp_params['dataset_params']['data_path'])
-    rp = SDRPlatform(sdr_f, channel=0)
+    sdr_f = load(config.sdr_file)
+    rp = SDRPlatform(sdr_f, origin=config.data_center, channel=0)
     flight_path = rp.txpos(rp.gpst)
     bores = rp.boresight(rp.gpst)
     fig = px.scatter_3d(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2])
@@ -108,8 +94,15 @@ if __name__ == '__main__':
     )
     fig.show()
 
-    mesh = o3d.io.read_triangle_mesh('./render_output.obj')
-    o3d.visualization.draw_plotly([mesh])
+    gx, gy, gz = np.meshgrid(np.linspace(-500, 500, 10),np.linspace(-500, 500, 10), np.linspace(-500, 500, 10))
+
+    fig = px.scatter_3d(x=gx.flatten(), y=gy.flatten(), z=gz.flatten())
+    fig.add_trace(go.Cone(x=rays_o[0, :, 0], y=rays_o[0, :, 1], z=rays_o[0, :, 2], u=rays_d[0, :, 0],
+                          v=rays_d[0, :, 1], w=rays_d[0, :, 2], anchor='tail', sizeref=55, sizemode='absolute'))
+    fig.show()
+
+    # mesh = o3d.io.read_triangle_mesh('./render_output.obj')
+    # o3d.visualization.draw_plotly([mesh])
 
 
 

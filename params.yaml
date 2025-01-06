@@ -7,8 +7,8 @@ nerf_params:
     scene: lego
   # model hyperparams
   model:
-    use_viewdirs: False
-    randomized: False
+    use_viewdirs: True
+    randomized: True
     ray_shape: cone  # should be "cylinder" if llff
     white_bkgd: False  # should be False if using llff
     override_defaults: True
@@ -57,49 +57,63 @@ nerf_params:
 
 
 # For SARNeRF
-sar_exp_params:
-  learn_params:
-    LR: 0.001
-    LR_final: .00005
-    weight_decay: 0.00001
-    scheduler_gamma: 0.9
-    coarse_weight_decay: 0.1
-    swa_start: .6
-    betas: [ .9, .99 ]
-    step_size: 1
-  model_params:
-    D: 2
-    hidden: 256
+sarnerf_params:
+  # basic hyperparams to specify where to load/save data from/to
+  basic:
+    log_dir: logs
+    sdr_file: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_113146.sar
+    data_center: [40.093229, -111.768341, 1353.06885]
+  # model hyperparams
+  model:
+    use_viewdirs: True
     randomized: True
-    ray_shape: cone
-    num_levels: 1
-    num_samples: 1024
-    density_noise: .001
-    density_bias: -1.
-    rgb_padding: 0.001
-    resample_padding: 0.01
+    ray_shape: cone  # should be "cylinder" if llff
+    override_defaults: True
+    num_levels: 2
+    num_samples: 180
+    hidden: 156
+    density_noise: 0.0
+    density_bias: -1.0
+    rgb_padding: 0.0001
+    resample_padding: 0.001
     min_deg: 0
-    max_deg: 16
-    return_raw: False
-    pulse_std: 781026276.4943413
-  train_params:
-    warm_start: False
-    log_epoch: 100
-    is_tuning: False
-    save_model: True
-    loss_landscape: False
-    patience: 500
-    max_epochs: 2000
-    log_dir: ./logs
-  dataset_params:
-    data_path: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_113146.sar
-    data_center: [40.0935619700, -111.7683527700, 1353.06885]
-    train_batch_size: 1
-    val_batch_size: 1
-    fft_sz: 8192
-    az_samples: 16
-    el_samples: 16
-    num_workers: 0
-    pin_memory: False
+    max_deg: 4
+    viewdirs_min_deg: 0
+    viewdirs_max_deg: 4
+    wavelength: 0.031228381041666666
+  # loss and optimizer hyperparams
+  loss:
+    coarse_weight_decay: 0.01
+    lr_init: .5
+    lr_final: .00005
+    lr_delay_steps: 5500
+    lr_delay_mult: 0.05
+    weight_decay: .000001
+  # training hyperparams
+  training:
+    factor: 2
     split: .7
-    collate: False
+    max_steps: 2500
+    batch_size: 1
+    do_eval: False
+    continue_training: True
+    save_every: 1000
+    device: cuda
+    az_samples: 48
+    el_samples: 48
+    num_workers: 0
+    single_example: False
+  # visualization hyperparams
+  visualization:
+    chunks: 8192
+    model_weight_path: log/sarmodel.pt
+    visualize_depth: True
+    visualize_normals: True
+  # extracting mesh hyperparams
+  mesh:
+    x_range: [-1.2, 1.2]
+    y_range: [-1.2, 1.2]
+    z_range: [-1.2, 1.2]
+    grid_size: 256
+    sigma_threshold: 50.0
+    occ_threshold: 0.2

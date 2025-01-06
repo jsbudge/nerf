@@ -221,11 +221,11 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far, random
         mids = 0.5 * (t_vals[..., 1:] + t_vals[..., :-1])
         upper = torch.cat([mids, t_vals[..., -1:]], -1)
         lower = torch.cat([t_vals[..., :1], mids], -1)
-        t_rand = torch.rand(batch_size, num_samples + 1, device=origins.device)
+        t_rand = torch.rand(batch_size, origins.shape[1], num_samples + 1, device=origins.device)
         t_vals = lower + (upper - lower) * t_rand
     else:
         # Broadcast t_vals to make the returned shape consistent.
-        t_vals = torch.broadcast_to(t_vals, [batch_size, num_samples + 1])
+        t_vals = torch.broadcast_to(t_vals, [batch_size, origins.shape[1], num_samples + 1])
     means, covs = cast_rays(t_vals, origins, directions, radii, ray_shape)
     return t_vals, (means, covs)
 
@@ -316,6 +316,68 @@ def volumetric_rendering(rgb, density, t_vals, dirs, white_bkgd):
     if white_bkgd:
         comp_rgb = comp_rgb + (1. - acc[..., None])
     return comp_rgb, distance, acc, weights, alpha
+
+
+def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelength):
+    """Volumetric Scattering Function.
+
+    Args:
+    rgb: torch.tensor(float32), color, [batch_size, num_samples, 3]
+    density: torch.tensor(float32), density, [batch_size, num_samples, 1].
+    t_vals: torch.tensor(float32), [batch_size, num_samples].
+    dirs: torch.tensor(float32), [batch_size, 3].
+
+    Returns:
+    comp_rgb: torch.tensor(float32), [batch_size, 3].
+    disp: torch.tensor(float32), [batch_size].
+    acc: torch.tensor(float32), [batch_size].
+    weights: torch.tensor(float32), [batch_size, num_samples]
+    """
+    t_mids = 0.5 * (t_vals[..., :-1] + t_vals[..., 1:])
+    t_dists = t_vals[..., 1:] - t_vals[..., :-1]
+    delta = t_dists * torch.linalg.norm(dirs[..., None, :], dim=-1)
+    # Note that we're quietly turning density from [..., 0] to [...].
+    density_delta = density[..., 0] * delta
+
+    alpha = 1 - torch.exp(-density_delta)
+    trans = torch.exp(-torch.cat([
+        torch.zeros_like(density_delta[..., :1]),
+        torch.cumsum(density_delta[..., :-1], dim=-1)
+    ], dim=-1))
+    weights = alpha * trans
+
+    # Calculate the angle of reflection
+    comp_ang = (weights[..., None] * angle).sum(dim=-2) * 3.14
+    normals = torch.stack([torch.sin(comp_ang[..., 0]) * torch.cos(comp_ang[..., 1]),
+                           torch.cos(comp_ang[..., 0]) * torch.cos(comp_ang[..., 1]),
+                           -torch.sin(comp_ang[..., 1])]).mT.swapaxes(0, 2)
+    comp_rgb = (weights[..., None] * rgb).sum(dim=-2)
+    acc = weights.sum(dim=-1)
+    distance = (weights * t_mids).sum(dim=-1) / acc
+    distance = torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1])
+    bounce = normals * torch.sum(-dirs * normals, dim=-1)[..., None] * 2 + dirs
+
+    '''nplot = normals.cpu().data.numpy()[0]
+    bplot = bounce.cpu().data.numpy()[0]
+    dplot = dirs.cpu().data.numpy()[0]
+
+    fig = plt.figure()
+    ax = fig.add_subplot(projection='3d')
+    ax.quiver(np.zeros(1444), np.zeros(1444), np.zeros(1444), nplot[:, 0], nplot[:, 1], nplot[:, 2], length=1., normalize=True, color='blue')
+    ax.quiver(np.zeros(1444), np.zeros(1444), np.zeros(1444), bplot[:, 0], bplot[:, 1], bplot[:, 2], length=1.,
+              normalize=True, color='green')
+    ax.quiver(-dplot[:, 0], -dplot[:, 1], -dplot[:, 2], dplot[:, 0], dplot[:, 1], dplot[:, 2], length=1.,
+              normalize=True, color='red')
+    plt.show()'''
+
+    ref_model = (comp_rgb[..., 0] * torch.sum(-dirs * normals, dim=-1) + comp_rgb[..., 1] * torch.nan_to_num(torch.abs(torch.sum(bounce * normals, dim=-1) *
+                                                comp_rgb[..., 1])**comp_rgb[..., 2])) / distance**2 * .25
+    # Calculate out expected phase as well
+    ret = torch.view_as_real(ref_model * torch.exp(-2j * torch.pi / wavelength * distance * 2))
+    calc_pulse_data = torch.zeros((ref_model.shape[0], pulse_bins.shape[1], 2), dtype=torch.float, device=ref_model.device)
+    for d in range(ref_model.shape[0]):
+        calc_pulse_data[d, torch.bucketize(distance[d], pulse_bins[d].to(distance.device))] += ret[d]
+    return calc_pulse_data, distance, acc, weights, alpha
 
 
 
@@ -566,3 +628,42 @@ def to_float(img):
         return np.array([to_float(i) for i in img])
     else:
         return (img / 255.).astype(np.float32)
+
+trans_t = lambda t: torch.Tensor([
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, t],
+    [0, 0, 0, 1]]).float()
+
+rot_tran_roll = lambda phi: torch.Tensor([
+    [1, 0, 0, 0],
+    [0, np.cos(phi), -np.sin(phi), 0],
+    [0, np.sin(phi), np.cos(phi), 0],
+    [0, 0, 0, 1]]).float()
+
+rot_tran_pitch = lambda th: torch.Tensor([
+    [np.cos(th), 0, -np.sin(th), 0],
+    [0, 1, 0, 0],
+    [np.sin(th), 0, np.cos(th), 0],
+    [0, 0, 0, 1]]).float()
+
+rot_tran_yaw = lambda th: torch.Tensor([
+    [np.cos(th), -np.sin(th), 0, 0],
+    [np.sin(th), np.cos(th), 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]]).float()
+
+rot_roll = lambda phi: torch.Tensor([
+    [1, 0, 0],
+    [0, np.cos(phi), -np.sin(phi)],
+    [0, np.sin(phi), np.cos(phi)]]).float()
+
+rot_pitch = lambda th: torch.Tensor([
+    [np.cos(th), 0, -np.sin(th)],
+    [0, 1, 0],
+    [np.sin(th), 0, np.cos(th)]]).float()
+
+rot_yaw = lambda th: torch.Tensor([
+    [np.cos(th), -np.sin(th), 0],
+    [np.sin(th), np.cos(th), 0],
+    [0, 0, 1]]).float()

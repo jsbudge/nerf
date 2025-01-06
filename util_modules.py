@@ -55,11 +55,32 @@ class NeRFLoss(torch.nn.modules.loss._Loss):
         super(NeRFLoss, self).__init__()
         self.coarse_weight_decay = coarse_weight_decay
 
-    def forward(self, input, target, mask):
+    def forward(self, input, target, mask=None):
         losses = []
         psnrs = []
         for rgb in input:
-            mse = (mask * ((rgb - target[..., :3]) ** 2)).sum() / mask.sum()
+            if mask is None:
+                mse = ((rgb - target[..., :3]) ** 2).mean()
+            else:
+                mse = (mask * ((rgb - target[..., :3]) ** 2)).sum() / mask.sum()
+            losses.append(mse)
+            with torch.no_grad():
+                psnrs.append(mse_to_psnr(mse))
+        losses = torch.stack(losses)
+        loss = self.coarse_weight_decay * torch.sum(losses[:-1]) + losses[-1]
+        return loss, torch.Tensor(psnrs)
+
+
+class SARNeRFLoss(torch.nn.modules.loss._Loss):
+    def __init__(self, coarse_weight_decay=0.1):
+        super(SARNeRFLoss, self).__init__()
+        self.coarse_weight_decay = coarse_weight_decay
+
+    def forward(self, input, target):
+        losses = []
+        psnrs = []
+        for rgb in input:
+            mse = ((rgb - target) ** 2).mean()
             losses.append(mse)
             with torch.no_grad():
                 psnrs.append(mse_to_psnr(mse))

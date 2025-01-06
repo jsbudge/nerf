@@ -3,7 +3,7 @@ from typing import List, Union, Optional
 from pytorch_lightning import LightningDataModule
 from sdrparse import load
 from simulib.platform_helper import SDRPlatform
-from simulib.simulation_functions import azelToVec
+from simulib.simulation_functions import azelToVec, findPowerOf2
 from sklearn.model_selection import train_test_split
 import cv2
 
@@ -16,7 +16,7 @@ import json
 import numpy as np
 from PIL import Image
 import torch
-from utils import Rays, convert_to_ndc, namedtuple_map
+from utils import Rays, convert_to_ndc, namedtuple_map, rot_yaw, rot_roll
 from utils import normalize, look_at, poses_avg, recenter_poses, to_float, generate_spiral_cam_to_world, generate_spherical_cam_to_world, flatten
 from torch.utils.data import Dataset, DataLoader
 
@@ -511,8 +511,8 @@ class NeRFModule(LightningDataModule):
 
 
 class SDRPulseDataset(Dataset):
-    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, fft_sz: int = 16384, az_samples: int = 32,
-                 el_samples: int = 32, pulse_std: float = 1., single_example: bool = False, is_val=False, seed=42):
+    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, az_samples: int = 32,
+                 el_samples: int = 32, single_example: bool = False, is_val=False, seed=42):
         sdr_f = load(sdr_file)
         idxes = np.arange(sdr_f[0].nframes)[::5]
 
@@ -528,19 +528,21 @@ class SDRPulseDataset(Dataset):
         self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[i_vals]), dtype=torch.float)
         self.pans = rp.pan(sdr_f[0].pulse_time[i_vals])
         self.tilts = rp.tilt(sdr_f[0].pulse_time[i_vals])
+        fft_sz = findPowerOf2(sdr_f[0].nsam + sdr_f[0].pulse_length)
         self.pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
                                   sdr_f.genMatchedFilter(0, fft_len=fft_sz), axis=1)[:, :sdr_f[0].nsam]
-        self.pulses = torch.view_as_real(torch.tensor(self.pulses / pulse_std))
+        # Normalize pulses so that they have a standard deviation of one
+        self.pulses = self.pulses / np.std(self.pulses, axis=-1)[:, None]
+        self.pulses = torch.view_as_real(torch.tensor(self.pulses))
         self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz))
-        self.mfilt = self.mfilt / self.mfilt.shape[0]
         near, far = rp.calcRanges(5.0, .75)
 
         azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw, rp.az_half_bw, az_samples), np.linspace(-rp.el_half_bw, rp.el_half_bw, el_samples))
         self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
-        dx = torch.sqrt(torch.sum((self.pvecs[:-1] - self.pvecs[1:]) ** 2, dim=-1))
+        dx = torch.sqrt(torch.sum((self.pvecs[:-1] * near - self.pvecs[1:] * near) ** 2, dim=-1))
         dx = torch.cat([dx, dx[-2:-1]], 0)
         radii = dx
-        ray_p = np.sinc(azes.flatten() / rp.az_half_bw) * np.sinc(eles.flatten() / rp.el_half_bw) * 10
+        ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2 * 10
         ray_mask = ray_p > 1e-9
         self.pvecs = self.pvecs[ray_mask]
         self.radii = radii[ray_mask]
@@ -551,9 +553,48 @@ class SDRPulseDataset(Dataset):
 
 
     def __getitem__(self, idx):
-        ray_d = self.pvecs @ rot_yaw(self.pans[idx]) @ rot_roll(self.tilts[idx])
+        ray_d = self.pvecs @ rot_roll(self.tilts[idx]) @ rot_yaw(self.pans[idx])
         return (torch.outer(torch.ones_like(self.radii), self.pos[idx]), ray_d, self.ray_p, self.mfilt, self.radii,
                 self.near, self.far, self.mpp, self.pulses[idx])
 
     def __len__(self):
         return self.pulses.shape[0]
+
+
+class SARNeRFModule(LightningDataModule):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.train_dataset = None
+        self.val_dataset = None
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
+                                             data_center = self.config.data_center, az_samples = self.config.az_samples,
+                 el_samples = self.config.el_samples, single_example = self.config.single_example, is_val=False, seed=42)
+
+        self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
+                                             data_center = self.config.data_center, az_samples = self.config.az_samples,
+                 el_samples = self.config.el_samples, single_example = self.config.single_example, is_val=True, seed=42)
+
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+        )
+
+    def val_dataloader(self) -> Union[DataLoader, List[DataLoader]]:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+        )
+
+    def render_loader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+        )
