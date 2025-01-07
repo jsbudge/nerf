@@ -60,12 +60,12 @@ if __name__ == '__main__':
 
     torch.save(model.state_dict(), config.model_weight_path)
 
-    rays_o, rays_d, rays_p, mfilt, radii, near, far, mpp, target = next(iter(data.train_dataloader()))
+    rays_o, pan, tilt, mfilt, radii, near, far, mpp, target = next(iter(data.train_dataloader()))
 
 
     print('Rendering pulse...')
     model.eval()
-    pulse, disp, acc = model(rays_o.to(model.device), rays_d.to(model.device), rays_p.to(model.device),
+    pulse, disp, acc = model(rays_o.to(model.device), pan.to(model.device), tilt.to(model.device),
                              mfilt.to(model.device), radii.to(model.device), near.to(model.device),
                              far.to(model.device), target.shape[1], mpp.to(model.device))
     np_pulse = pulse.cpu().data.numpy()

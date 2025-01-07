@@ -318,7 +318,7 @@ def volumetric_rendering(rgb, density, t_vals, dirs, white_bkgd):
     return comp_rgb, distance, acc, weights, alpha
 
 
-def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelength):
+def volumetric_scattering(rgb, angle, density, power, t_vals, dirs, pulse_bins, wavelength):
     """Volumetric Scattering Function.
 
     Args:
@@ -370,7 +370,7 @@ def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelen
               normalize=True, color='red')
     plt.show()'''
 
-    ref_model = (comp_rgb[..., 0] * torch.sum(-dirs * normals, dim=-1) + comp_rgb[..., 1] * torch.nan_to_num(torch.abs(torch.sum(bounce * normals, dim=-1) *
+    ref_model = power * (comp_rgb[..., 0] * torch.sum(-dirs * normals, dim=-1) + comp_rgb[..., 1] * torch.nan_to_num(torch.abs(torch.sum(bounce * normals, dim=-1) *
                                                 comp_rgb[..., 1])**comp_rgb[..., 2])) / distance**2 * .25
     # Calculate out expected phase as well
     ret = torch.view_as_real(ref_model * torch.exp(-2j * torch.pi / wavelength * distance * 2))

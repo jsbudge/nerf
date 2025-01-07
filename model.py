@@ -243,9 +243,14 @@ class SARNeRF(LightningModule):
         self.density_bias = config.density_bias
         self.hidden = config.hidden
         self.wavelength = config.wavelength
+        self.total_num_rays = config.total_num_rays
+        self.rays_per_chunk = config.rays_per_chunk
         self.return_raw = return_raw
         self.automatic_optimization = False
         self.density_activation = nn.Softplus()
+
+        self.num_ray_iters = int(self.total_num_rays // self.rays_per_chunk)
+        self.cube_dim = int(np.sqrt(self.rays_per_chunk))
 
         self.loss_function = SARNeRFLoss(config.coarse_weight_decay)
 
@@ -297,66 +302,82 @@ class SARNeRF(LightningModule):
         )
         _xavier_init(self)
 
-    def forward(self, ray_o, ray_d, ray_p, mfilt, radii, _near, _far, nsam, mpp):
+    def forward(self, ray_o, pan, tilt, mfilt, _radii, _near, _far, nsam, mpp):
         comp_rgbs = []
         distances = []
         accs = []
-        near = torch.ones_like(radii, device=self.device) * _near[:, None]
-        far = torch.ones_like(radii, device=self.device) * _far[:, None]
+        for _ in range(self.num_levels):
+            comp_rgbs.append(torch.zeros((ray_o.shape[0], nsam, 2), device=self.device))
+            distances.append(torch.zeros((ray_o.shape[0], self.rays_per_chunk, self.num_samples), device=self.device))
+            accs.append(torch.zeros((ray_o.shape[0], self.rays_per_chunk, self.num_samples), device=self.device))
+        near = torch.ones((ray_o.shape[0], self.rays_per_chunk, 1), device=self.device) * _near[:, None]
+        far = torch.ones((ray_o.shape[0], self.rays_per_chunk, 1), device=self.device) * _far[:, None]
+        radii = torch.ones((ray_o.shape[0], self.rays_per_chunk, 1), device=self.device) * _radii[:, None]
         pulse_bins = torch.arange(nsam, device=self.device)[None, :] * mpp[:, None] + _near[:, None]
+        for _ in range(self.num_ray_iters):
+            ray_o_chunk = ray_o.unsqueeze(1).repeat((1, self.rays_per_chunk, 1))
+            az = torch.randn(self.rays_per_chunk).unsqueeze(1) * 0.039269908169872414
+            el = torch.randn(self.rays_per_chunk).unsqueeze(1) * 0.09599310885968812
+            ray_d = torch.stack([torch.sin(az) * torch.cos(el),
+                                   torch.cos(az) * torch.cos(el),
+                                   -torch.sin(el)]).swapaxes(0, 2).to(self.device)
+            ray_p = torch.sinc(az / 0.039269908169872414)**2 * np.sinc(el / 0.09599310885968812)**2 * 1e9
+            ray_p = ray_p.T.to(self.device)
+            for l in range(self.num_levels):
+                # sample
+                if l == 0:  # coarse grain sample
+                    t_vals, (mean, var) = sample_along_rays(ray_o_chunk, ray_d, radii, self.num_samples,
+                                                            near, far, randomized=self.randomized, lindisp=False,
+                                                            ray_shape=self.ray_shape)
+                else:  # fine grain sample/s
+                    t_vals, (mean, var) = resample_along_rays(ray_o_chunk, ray_d, radii,
+                                                              t_vals.to(self.device),
+                                                              weights.to(self.device), randomized=self.randomized,
+                                                              stop_grad=True, resample_padding=self.resample_padding,
+                                                              ray_shape=self.ray_shape)
+                # do integrated positional encoding of samples
+                samples_enc = self.positional_encoding(mean, var)[0]
+                samples_enc = samples_enc.reshape([-1, samples_enc.shape[-1]])
+
+                # predict density
+                new_encodings = self.density_net0(samples_enc)
+                new_encodings = torch.cat((new_encodings, samples_enc), -1)
+                new_encodings = self.density_net1(new_encodings)
+                raw_density = self.final_density(new_encodings).reshape((ray_o_chunk.shape[0], -1, self.num_samples, 1))
+
+                # predict rgb
+                if self.use_viewdirs:
+                    #  do positional encoding of viewdirs
+                    viewdirs = self.viewdirs_encoding(ray_d)
+                    viewdirs = torch.cat((viewdirs, ray_d), -1)
+                    viewdirs = torch.tile(viewdirs[:, None, :], (1, self.num_samples, 1))
+                    viewdirs = viewdirs.reshape((-1, viewdirs.shape[-1]))
+                    new_encodings = self.rgb_net0(new_encodings)
+                    new_encodings = torch.cat((new_encodings, viewdirs), -1)
+                    new_encodings = self.rgb_net1(new_encodings)
+                raw_rgb = self.final_rgb(new_encodings).reshape((ray_o_chunk.shape[0], -1, self.num_samples, 3))
+                angle = self.final_angle(new_encodings).reshape((ray_o_chunk.shape[0], -1, self.num_samples, 2))
+
+                # Add noise to regularize the density predictions if needed.
+                if self.randomized and self.density_noise:
+                    raw_density += self.density_noise * torch.rand(raw_density.shape, dtype=raw_density.dtype, device=raw_density.device)
+
+                # volumetric rendering
+                rgb = raw_rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+                # angle = raw_angles * (1 + 2 * self.rgb_padding) - self.rgb_padding
+                density = self.density_activation(raw_density + self.density_bias)
+                comp_rp, distance, acc, weights, alpha = volumetric_scattering(rgb, angle, density, ray_p, t_vals, ray_d,
+                                                                               pulse_bins,
+                                                                               self.wavelength)
+                # comp_rp = torch.fft.fft(torch.view_as_complex(comp_rp), mfilt.shape[-1], dim=-1)
+
+                comp_rgbs[l] += comp_rp
+                distances[l] = distance
+                accs[l] = acc
         for l in range(self.num_levels):
-            # sample
-            if l == 0:  # coarse grain sample
-                t_vals, (mean, var) = sample_along_rays(ray_o, ray_d, radii.unsqueeze(2), self.num_samples,
-                                                        near.unsqueeze(2), far.unsqueeze(2), randomized=self.randomized, lindisp=False,
-                                                        ray_shape=self.ray_shape)
-            else:  # fine grain sample/s
-                t_vals, (mean, var) = resample_along_rays(ray_o, ray_d, radii.unsqueeze(2),
-                                                          t_vals.to(self.device),
-                                                          weights.to(self.device), randomized=self.randomized,
-                                                          stop_grad=True, resample_padding=self.resample_padding,
-                                                          ray_shape=self.ray_shape)
-            # do integrated positional encoding of samples
-            samples_enc = self.positional_encoding(mean, var)[0]
-            samples_enc = samples_enc.reshape([-1, samples_enc.shape[-1]])
-
-            # predict density
-            new_encodings = self.density_net0(samples_enc)
-            new_encodings = torch.cat((new_encodings, samples_enc), -1)
-            new_encodings = self.density_net1(new_encodings)
-            raw_density = self.final_density(new_encodings).reshape((ray_o.shape[0], -1, self.num_samples, 1))
-
-            # predict rgb
-            if self.use_viewdirs:
-                #  do positional encoding of viewdirs
-                viewdirs = self.viewdirs_encoding(ray_d)
-                viewdirs = torch.cat((viewdirs, ray_d), -1)
-                viewdirs = torch.tile(viewdirs[:, None, :], (1, self.num_samples, 1))
-                viewdirs = viewdirs.reshape((-1, viewdirs.shape[-1]))
-                new_encodings = self.rgb_net0(new_encodings)
-                new_encodings = torch.cat((new_encodings, viewdirs), -1)
-                new_encodings = self.rgb_net1(new_encodings)
-            raw_rgb = self.final_rgb(new_encodings).reshape((ray_o.shape[0], -1, self.num_samples, 3))
-            angle = self.final_angle(new_encodings).reshape((ray_o.shape[0], -1, self.num_samples, 2))
-
-            # Add noise to regularize the density predictions if needed.
-            if self.randomized and self.density_noise:
-                raw_density += self.density_noise * torch.rand(raw_density.shape, dtype=raw_density.dtype, device=raw_density.device)
-
-            # volumetric rendering
-            rgb = raw_rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
-            # angle = raw_angles * (1 + 2 * self.rgb_padding) - self.rgb_padding
-            density = self.density_activation(raw_density + self.density_bias)
-            comp_rp, distance, acc, weights, alpha = volumetric_scattering(rgb, angle, density, t_vals, ray_d,
-                                                                           pulse_bins,
-                                                                           self.wavelength)
-            comp_rp = torch.fft.fft(torch.view_as_complex(comp_rp), mfilt.shape[-1], dim=-1)
-            comp_pulse = torch.fft.ifft(mfilt * comp_rp, dim=-1)[..., :nsam]
-            comp_pulse = comp_pulse / torch.std(comp_pulse, dim=-1)[..., None]
-            comp_pulse = torch.view_as_real(comp_pulse)
-            comp_rgbs.append(comp_pulse)
-            distances.append(distance)
-            accs.append(acc)
+            comp_rgbs[l] = torch.fft.ifft(mfilt * torch.fft.fft(torch.view_as_complex(comp_rgbs[l]), mfilt.shape[-1], dim=-1), dim=-1)[..., :nsam]
+            comp_rgbs[l] = comp_rgbs[l] / torch.std(comp_rgbs[l], dim=-1)[..., None]
+            comp_rgbs[l] = torch.view_as_real(comp_rgbs[l])
         if self.return_raw:
             raws = torch.cat((torch.clone(rgb).detach(), torch.clone(density).detach()), -1).cpu()
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
@@ -385,10 +406,10 @@ class SARNeRF(LightningModule):
         self.train_val_get(batch, batch_idx, 'val')
 
     def train_val_get(self, batch, batch_idx, kind='train'):
-        ray_o, ray_d, ray_p, mfilt, radii, near, far, mpp, pulse_data = batch
+        ray_o, pan, tilt, mfilt, radii, near, far, mpp, pulse_data = batch
 
         # Generate rays for random sampling
-        rgb, _, _ = self.forward(ray_o, ray_d, ray_p, mfilt, radii, near, far, pulse_data.shape[1], mpp)
+        rgb, _, _ = self.forward(ray_o, pan, tilt, mfilt, radii, near, far, pulse_data.shape[1], mpp)
 
         train_loss, psnrs = self.loss_function(rgb, pulse_data)
 

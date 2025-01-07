@@ -537,25 +537,16 @@ class SDRPulseDataset(Dataset):
         self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz))
         near, far = rp.calcRanges(5.0, .75)
 
-        azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw, rp.az_half_bw, az_samples), np.linspace(-rp.el_half_bw, rp.el_half_bw, el_samples))
-        self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
-        dx = torch.sqrt(torch.sum((self.pvecs[:-1] * near - self.pvecs[1:] * near) ** 2, dim=-1))
-        dx = torch.cat([dx, dx[-2:-1]], 0)
-        radii = dx
-        ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2 * 10
-        ray_mask = ray_p > 1e-9
-        self.pvecs = self.pvecs[ray_mask]
-        self.radii = radii[ray_mask]
-        self.ray_p = ray_p[ray_mask]
+        self.pvecs = torch.tensor(rp.boresight(sdr_f[0].pulse_time[i_vals]), dtype=torch.float)
+        self.radii = np.float32(1.12)
         self.near = np.float32(near)
         self.far = np.float32(far)
         self.mpp = c0 / rp.fs / 2
 
 
     def __getitem__(self, idx):
-        ray_d = self.pvecs @ rot_roll(self.tilts[idx]) @ rot_yaw(self.pans[idx])
-        return (torch.outer(torch.ones_like(self.radii), self.pos[idx]), ray_d, self.ray_p, self.mfilt, self.radii,
-                self.near, self.far, self.mpp, self.pulses[idx])
+        return (self.pos[idx], self.pans[idx], self.tilts[idx], self.mfilt, self.radii, self.near, self.far, self.mpp,
+                self.pulses[idx])
 
     def __len__(self):
         return self.pulses.shape[0]

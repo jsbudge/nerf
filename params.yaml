@@ -80,6 +80,8 @@ sarnerf_params:
     max_deg: 4
     viewdirs_min_deg: 0
     viewdirs_max_deg: 4
+    rays_per_chunk: 2048
+    total_num_rays: 2048
     wavelength: 0.031228381041666666
   # loss and optimizer hyperparams
   loss:
