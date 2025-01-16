@@ -66,54 +66,56 @@ sarnerf_params:
   # model hyperparams
   model:
     use_viewdirs: True
-    randomized: True
+    randomized: False
     ray_shape: cone  # should be "cylinder" if llff
     override_defaults: True
     num_levels: 2
-    num_samples: 180
-    hidden: 156
+    num_samples: 128
+    hidden: 256
     density_noise: 0.0
-    density_bias: -1.0
+    density_bias: 0.0
     rgb_padding: 0.0001
     resample_padding: 0.001
     min_deg: 0
-    max_deg: 4
+    max_deg: 8
     viewdirs_min_deg: 0
     viewdirs_max_deg: 4
     wavelength: 0.031228381041666666
+    accumulation_steps: 1
   # loss and optimizer hyperparams
   loss:
-    coarse_weight_decay: 0.01
-    lr_init: .5
+    coarse_weight_decay: 0.1
+    lr_init: .001
     lr_final: .00005
-    lr_delay_steps: 5500
-    lr_delay_mult: 0.05
-    weight_decay: .000001
+    lr_delay_steps: 17500
+    lr_delay_mult: 0.1
+    weight_decay: 0.0
   # training hyperparams
   training:
     factor: 2
     split: .7
-    max_steps: 2500
+    max_epochs: 2500
     batch_size: 1
     do_eval: False
     continue_training: True
     save_every: 1000
     device: cuda
-    az_samples: 48
-    el_samples: 48
+    az_samples: 32
+    el_samples: 32
     num_workers: 0
     single_example: False
+    distributed: False
   # visualization hyperparams
   visualization:
-    chunks: 8192
+    chunks: 1024
     model_weight_path: log/sarmodel.pt
     visualize_depth: True
     visualize_normals: True
   # extracting mesh hyperparams
   mesh:
-    x_range: [-1.2, 1.2]
-    y_range: [-1.2, 1.2]
-    z_range: [-1.2, 1.2]
+    x_range: [-200, 200]
+    y_range: [-200, 200]
+    z_range: [-12, 12]
     grid_size: 256
     sigma_threshold: 50.0
     occ_threshold: 0.2

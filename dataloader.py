@@ -512,8 +512,11 @@ class NeRFModule(LightningDataModule):
 
 class SDRPulseDataset(Dataset):
     def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, az_samples: int = 32,
-                 el_samples: int = 32, single_example: bool = False, is_val=False, seed=42):
-        sdr_f = load(sdr_file)
+                 el_samples: int = 32, distributed: bool = False, is_val: bool = False, seed: int = 42):
+        if distributed:
+            sdr_f = load(sdr_file, import_pickle=False, export_pickle=False)
+        else:
+            sdr_f = load(sdr_file)
         idxes = np.arange(sdr_f[0].nframes)[::5]
 
         if split < 1:
@@ -539,7 +542,7 @@ class SDRPulseDataset(Dataset):
 
         azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw, rp.az_half_bw, az_samples), np.linspace(-rp.el_half_bw, rp.el_half_bw, el_samples))
         self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
-        dx = torch.sqrt(torch.sum((self.pvecs[:-1] * near - self.pvecs[1:] * near) ** 2, dim=-1))
+        dx = torch.sqrt(torch.sum((self.pvecs[:-1] - self.pvecs[1:]) ** 2, dim=-1))
         dx = torch.cat([dx, dx[-2:-1]], 0)
         radii = dx
         ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2 * 10
@@ -571,11 +574,11 @@ class SARNeRFModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
                                              data_center = self.config.data_center, az_samples = self.config.az_samples,
-                 el_samples = self.config.el_samples, single_example = self.config.single_example, is_val=False, seed=42)
+                 el_samples = self.config.el_samples, distributed = self.config.distributed, is_val=False, seed=42)
 
         self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
                                              data_center = self.config.data_center, az_samples = self.config.az_samples,
-                 el_samples = self.config.el_samples, single_example = self.config.single_example, is_val=True, seed=42)
+                 el_samples = self.config.el_samples, distributed = self.config.distributed, is_val=True, seed=42)
 
 
     def train_dataloader(self) -> DataLoader:

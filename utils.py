@@ -2,8 +2,10 @@ import numpy as np
 import torch
 import collections
 import matplotlib.cm as cm
+from graphviz import Digraph
+from matplotlib import pyplot as plt
 from scipy import signal
-
+from torch.autograd import Variable
 
 Rays = collections.namedtuple('Rays', ('origins', 'directions', 'viewdirs', 'radii', 'lossmult', 'near', 'far'))
 
@@ -19,7 +21,7 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     eps = 1e-5
     weight_sum = torch.sum(weights, dim=-1, keepdim=True)
     padding = torch.maximum(torch.zeros_like(weight_sum), eps - weight_sum)
-    weights += padding / weights.shape[-1]
+    weights = weights + (padding / weights.shape[-1])
     weight_sum += padding
 
     # Compute the PDF and CDF for each weight vector, while ensuring that the CDF
@@ -36,7 +38,8 @@ def sorted_piecewise_constant_pdf(bins, weights, num_samples, randomized):
     if randomized:
         s = 1 / num_samples
         u = (torch.arange(num_samples, device=cdf.device) * s)[None, ...]
-        u = u + u + torch.empty(list(cdf.shape[:-1]) + [num_samples], device=cdf.device).uniform_(to=(s - torch.finfo(torch.float32).eps))
+        u = u + u + torch.empty(list(cdf.shape[:-1]) + [num_samples], device=cdf.device).uniform_(
+            to=(s - torch.finfo(torch.float32).eps))
         # `u` is in [0, 1) --- it can be zero, but it can never be 1.
         u = torch.minimum(u, torch.full_like(u, 1. - torch.finfo(torch.float32).eps, device=u.device))
     else:
@@ -230,7 +233,7 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far, random
     return t_vals, (means, covs)
 
 
-def resample_along_rays(origins, directions, radii, t_vals, weights, randomized, stop_grad, resample_padding, ray_shape):
+def resample_along_rays(origins, directions, radii, t_vals, weights, randomized, stop_grad, ray_shape):
     """Resampling.
 
     Args:
@@ -249,12 +252,6 @@ def resample_along_rays(origins, directions, radii, t_vals, weights, randomized,
     """
     if stop_grad:
         with torch.no_grad():
-            weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1)
-            weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:])
-            weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:])
-
-            # Add in a constant (the sampling function will renormalize the PDF).
-            weights = weights_blur + resample_padding
 
             new_t_vals = sorted_piecewise_constant_pdf(
                 t_vals,
@@ -263,12 +260,6 @@ def resample_along_rays(origins, directions, radii, t_vals, weights, randomized,
                 randomized,
             )
     else:
-        weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1)
-        weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:])
-        weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:])
-
-        # Add in a constant (the sampling function will renormalize the PDF).
-        weights = weights_blur + resample_padding
 
         new_t_vals = sorted_piecewise_constant_pdf(
             t_vals,
@@ -318,7 +309,7 @@ def volumetric_rendering(rgb, density, t_vals, dirs, white_bkgd):
     return comp_rgb, distance, acc, weights, alpha
 
 
-def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelength):
+def distance_calculation(density, t_vals, dirs):
     """Volumetric Scattering Function.
 
     Args:
@@ -344,17 +335,32 @@ def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelen
         torch.zeros_like(density_delta[..., :1]),
         torch.cumsum(density_delta[..., :-1], dim=-1)
     ], dim=-1))
+    # trans = torch.where(trans < .5, trans, 0.)
     weights = alpha * trans
 
-    # Calculate the angle of reflection
-    comp_ang = (weights[..., None] * angle).sum(dim=-2) * 3.14
-    normals = torch.stack([torch.sin(comp_ang[..., 0]) * torch.cos(comp_ang[..., 1]),
-                           torch.cos(comp_ang[..., 0]) * torch.cos(comp_ang[..., 1]),
-                           -torch.sin(comp_ang[..., 1])]).mT.swapaxes(0, 2)
-    comp_rgb = (weights[..., None] * rgb).sum(dim=-2)
     acc = weights.sum(dim=-1)
     distance = (weights * t_mids).sum(dim=-1) / acc
     distance = torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1])
+    return distance, acc, weights, alpha, trans
+
+
+def volumetric_scattering(params, weights, normals, distance, dirs, pulse_bins, wavelength):
+    """Volumetric Scattering Function.
+
+    Args:
+    rgb: torch.tensor(float32), color, [batch_size, num_samples, 3]
+    density: torch.tensor(float32), density, [batch_size, num_samples, 1].
+    t_vals: torch.tensor(float32), [batch_size, num_samples].
+    dirs: torch.tensor(float32), [batch_size, 3].
+
+    Returns:
+    comp_rgb: torch.tensor(float32), [batch_size, 3].
+    disp: torch.tensor(float32), [batch_size].
+    acc: torch.tensor(float32), [batch_size].
+    weights: torch.tensor(float32), [batch_size, num_samples]
+    """
+    # comp_rgb = (weights[..., None] * params).sum(dim=-2)
+    comp_rgb = torch.sum(weights[..., None] * params, dim=-2)
     bounce = normals * torch.sum(-dirs * normals, dim=-1)[..., None] * 2 + dirs
 
     '''nplot = normals.cpu().data.numpy()[0]
@@ -372,12 +378,13 @@ def volumetric_scattering(rgb, angle, density, t_vals, dirs, pulse_bins, wavelen
 
     ref_model = (comp_rgb[..., 0] * torch.sum(-dirs * normals, dim=-1) + comp_rgb[..., 1] * torch.nan_to_num(torch.abs(torch.sum(bounce * normals, dim=-1) *
                                                 comp_rgb[..., 1])**comp_rgb[..., 2])) / distance**2 * .25
+    indices = torch.stack([torch.bucketize(distance[d], pulse_bins[d]) for d in range(ref_model.shape[0])])
+    indices = torch.dstack([indices, indices])
     # Calculate out expected phase as well
     ret = torch.view_as_real(ref_model * torch.exp(-2j * torch.pi / wavelength * distance * 2))
-    calc_pulse_data = torch.zeros((ref_model.shape[0], pulse_bins.shape[1], 2), dtype=torch.float, device=ref_model.device)
-    for d in range(ref_model.shape[0]):
-        calc_pulse_data[d, torch.bucketize(distance[d], pulse_bins[d].to(distance.device))] += ret[d]
-    return calc_pulse_data, distance, acc, weights, alpha
+    calc_pulse_data = torch.zeros((ref_model.shape[0], pulse_bins.shape[1] + 1, 2), dtype=torch.float, device=ref_model.device)
+    calc_pulse_data = calc_pulse_data.scatter_reduce(1, indices, ret, reduce='sum')
+    return calc_pulse_data
 
 
 
@@ -667,3 +674,69 @@ rot_yaw = lambda th: torch.Tensor([
     [np.cos(th), -np.sin(th), 0],
     [np.sin(th), np.cos(th), 0],
     [0, 0, 1]]).float()
+
+
+def get_sphere_intersection(cam_loc, ray_directions, r=1.0):
+    n_imgs, n_pix, _ = ray_directions.shape
+    cam_loc = cam_loc.unsqueeze(-1)
+    ray_cam_dot = torch.bmm(ray_directions, cam_loc).squeeze()
+    under_sqrt = ray_cam_dot ** 2 - (cam_loc.norm(2, 1) ** 2 - r ** 2)
+
+    under_sqrt = under_sqrt.reshape(-1)
+    mask_intersect = under_sqrt > 0
+
+    sphere_intersections = torch.zeros(n_imgs * n_pix, 2).cuda().float()
+    sphere_intersections[mask_intersect] = torch.sqrt(under_sqrt[mask_intersect]).unsqueeze(-1) * torch.Tensor(
+        [-1, 1]).cuda().float()
+    sphere_intersections[mask_intersect] -= ray_cam_dot.reshape(-1)[mask_intersect].unsqueeze(-1)
+
+    sphere_intersections = sphere_intersections.reshape(n_imgs, n_pix, 2)
+    sphere_intersections = sphere_intersections.clamp_min(0.0)
+    mask_intersect = mask_intersect.reshape(n_imgs, n_pix)
+
+    return sphere_intersections, mask_intersect
+
+
+def plot_grad_flow(named_parameters):
+    ave_grads = []
+    layers = []
+    for n, p in named_parameters:
+        if p.requires_grad and ("bias" not in n):
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean().cpu().data.numpy())
+    plt.plot(ave_grads, alpha=0.3, color="b")
+    plt.hlines(0, 0, len(ave_grads)+1, linewidth=1, color="k" )
+    plt.xticks(range(len(ave_grads)), layers, rotation=45)
+    plt.xlim(xmin=0, xmax=len(ave_grads))
+    plt.xlabel("Layers")
+    plt.ylabel("Average Gradient")
+    plt.title("Gradient Flow")
+    plt.grid(True)
+    
+    
+def make_dot(var):
+    node_attr = dict(style='filled',
+                     shape='box',
+                     align='left',
+                     fontsize='12',
+                     ranksep='0.1',
+                     height='0.2')
+    dot = Digraph(node_attr=node_attr, graph_attr=dict(size="12,12"))
+    seen = set()
+
+    def add_nodes(var):
+        if var in seen:
+            return
+        if isinstance(var, Variable):
+            value = '(' + ', '.join(['%d' % v for v in var.size()]) + ')'
+            dot.node(id(var), str(value), fillcolor='lightblue')
+        else:
+            dot.node(id(var), str(type(var).__name__))
+        seen.add(var)
+        if hasattr(var, 'previous_functions'):
+            for u in var.previous_functions:
+                dot.edge(id(u[0]), id(var))
+                add_nodes(u[0])
+
+    add_nodes(var.creator)
+    return dot

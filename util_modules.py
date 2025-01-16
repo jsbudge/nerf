@@ -75,18 +75,22 @@ class SARNeRFLoss(torch.nn.modules.loss._Loss):
     def __init__(self, coarse_weight_decay=0.1):
         super(SARNeRFLoss, self).__init__()
         self.coarse_weight_decay = coarse_weight_decay
+        self.eikonal_weight = .1
 
-    def forward(self, input, target):
+    def forward(self, pulse_data, gt, target):
         losses = []
         psnrs = []
-        for rgb in input:
+        for rgb in pulse_data:
             mse = ((rgb - target) ** 2).mean()
             losses.append(mse)
             with torch.no_grad():
                 psnrs.append(mse_to_psnr(mse))
         losses = torch.stack(losses)
         loss = self.coarse_weight_decay * torch.sum(losses[:-1]) + losses[-1]
-        return loss, torch.Tensor(psnrs)
+        return loss + self.eikonal_weight * self.eikonal_loss(gt), torch.Tensor(psnrs)
+
+    def eikonal_loss(self, grad_theta):
+        return ((grad_theta.norm(2, dim=1) - 1)**2).mean()
 
 
 def mse_to_psnr(mse):
