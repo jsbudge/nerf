@@ -194,6 +194,44 @@ def cast_rays(t_vals, origins, directions, radii, ray_shape, diag=True):
     return means, covs
 
 
+'''def sample_along_rays(origins, directions, radii, num_samples, near, far, randomized, lindisp, ray_shape):
+    """Stratified sampling along the rays.
+
+    Args:
+      origins: torch.tensor(float32), [batch_size, 3], ray origins.
+      directions: torch.tensor(float32), [batch_size, 3], ray directions.
+      radii: torch.tensor(float32), [batch_size, 3], ray radii.
+      num_samples: int.
+      near: torch.tensor, [batch_size, 1], near clip.
+      far: torch.tensor, [batch_size, 1], far clip.
+      randomized: bool, use randomized stratified sampling.
+      lindisp: bool, sampling linearly in disparity rather than depth.
+
+    Returns:
+      t_vals: torch.tensor, [batch_size, num_samples], sampled z values.
+      means: torch.tensor, [batch_size, num_samples, 3], sampled means.
+      covs: torch.tensor, [batch_size, num_samples, 3, 3], sampled covariances.
+    """
+    batch_size = origins.shape[0]
+
+    t_vals = torch.linspace(0., 1., num_samples + 1,  device=origins.device)
+    if lindisp:
+        t_vals = 1. / (1. / near * (1. - t_vals) + 1. / far * t_vals)
+    else:
+        t_vals = near * (1. - t_vals) + far * t_vals
+
+    if randomized:
+        mids = 0.5 * (t_vals[..., 1:] + t_vals[..., :-1])
+        upper = torch.cat([mids, t_vals[..., -1:]], -1)
+        lower = torch.cat([t_vals[..., :1], mids], -1)
+        t_rand = torch.rand(batch_size, origins.shape[1], num_samples + 1, device=origins.device)
+        t_vals = lower + (upper - lower) * t_rand
+    else:
+        # Broadcast t_vals to make the returned shape consistent.
+        t_vals = torch.broadcast_to(t_vals, [batch_size, origins.shape[1], num_samples + 1])
+    means, covs = cast_rays(t_vals, origins, directions, radii, ray_shape)
+    return t_vals, (means, covs)'''
+
 def sample_along_rays(origins, directions, radii, num_samples, near, far, randomized, lindisp, ray_shape):
     """Stratified sampling along the rays.
 
@@ -233,7 +271,7 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far, random
     return t_vals, (means, covs)
 
 
-def resample_along_rays(origins, directions, radii, t_vals, weights, randomized, stop_grad, ray_shape):
+def resample_along_rays(origins, directions, radii, t_vals, weights, randomized, stop_grad, num_samples, resample_padding, ray_shape):
     """Resampling.
 
     Args:
@@ -252,19 +290,31 @@ def resample_along_rays(origins, directions, radii, t_vals, weights, randomized,
     """
     if stop_grad:
         with torch.no_grad():
+            weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1)
+            weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:])
+            weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:])
+
+            # Add in a constant (the sampling function will renormalize the PDF).
+            weights = weights_blur + resample_padding
 
             new_t_vals = sorted_piecewise_constant_pdf(
                 t_vals,
                 weights,
-                t_vals.shape[-1],
+                num_samples,
                 randomized,
             )
     else:
+        weights_pad = torch.cat([weights[..., :1], weights, weights[..., -1:]], dim=-1)
+        weights_max = torch.maximum(weights_pad[..., :-1], weights_pad[..., 1:])
+        weights_blur = 0.5 * (weights_max[..., :-1] + weights_max[..., 1:])
+
+        # Add in a constant (the sampling function will renormalize the PDF).
+        weights = weights_blur + resample_padding
 
         new_t_vals = sorted_piecewise_constant_pdf(
             t_vals,
             weights,
-            t_vals.shape[-1],
+            num_samples,
             randomized,
         )
     means, covs = cast_rays(new_t_vals, origins, directions, radii, ray_shape)
@@ -676,25 +726,23 @@ rot_yaw = lambda th: torch.Tensor([
     [0, 0, 1]]).float()
 
 
-def get_sphere_intersection(cam_loc, ray_directions, r=1.0):
-    n_imgs, n_pix, _ = ray_directions.shape
-    cam_loc = cam_loc.unsqueeze(-1)
-    ray_cam_dot = torch.bmm(ray_directions, cam_loc).squeeze()
-    under_sqrt = ray_cam_dot ** 2 - (cam_loc.norm(2, 1) ** 2 - r ** 2)
+def get_sphere_intersections(cam_loc, ray_directions, r = 1.0):
+    # Input: n_rays x 3 ; n_rays x 3
+    # Output: n_rays x 1, n_rays x 1 (close and far)
 
-    under_sqrt = under_sqrt.reshape(-1)
-    mask_intersect = under_sqrt > 0
+    ray_cam_dot = torch.bmm(ray_directions.view(-1, 1, 3),
+                            cam_loc.view(-1, 3, 1)).squeeze(-1)
+    under_sqrt = ray_cam_dot ** 2 - (cam_loc.norm(2, 1, keepdim=True) ** 2 - r ** 2)
 
-    sphere_intersections = torch.zeros(n_imgs * n_pix, 2).cuda().float()
-    sphere_intersections[mask_intersect] = torch.sqrt(under_sqrt[mask_intersect]).unsqueeze(-1) * torch.Tensor(
-        [-1, 1]).cuda().float()
-    sphere_intersections[mask_intersect] -= ray_cam_dot.reshape(-1)[mask_intersect].unsqueeze(-1)
+    # sanity check
+    if (under_sqrt <= 0).sum() > 0:
+        print('BOUNDING SPHERE PROBLEM!')
+        exit()
 
-    sphere_intersections = sphere_intersections.reshape(n_imgs, n_pix, 2)
+    sphere_intersections = torch.sqrt(under_sqrt) * torch.Tensor([-1, 1]).cuda().float() - ray_cam_dot
     sphere_intersections = sphere_intersections.clamp_min(0.0)
-    mask_intersect = mask_intersect.reshape(n_imgs, n_pix)
 
-    return sphere_intersections, mask_intersect
+    return sphere_intersections
 
 
 def plot_grad_flow(named_parameters):

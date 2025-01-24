@@ -75,22 +75,26 @@ class SARNeRFLoss(torch.nn.modules.loss._Loss):
     def __init__(self, coarse_weight_decay=0.1):
         super(SARNeRFLoss, self).__init__()
         self.coarse_weight_decay = coarse_weight_decay
-        self.eikonal_weight = .1
+        self.eikonal_weight = 1e-3
+        self.acc_weight = 1e-1
+        self.std_weight = 0  #1e-1
 
-    def forward(self, pulse_data, gt, target):
-        losses = []
-        psnrs = []
-        for rgb in pulse_data:
-            mse = ((rgb - target) ** 2).mean()
-            losses.append(mse)
-            with torch.no_grad():
-                psnrs.append(mse_to_psnr(mse))
-        losses = torch.stack(losses)
-        loss = self.coarse_weight_decay * torch.sum(losses[:-1]) + losses[-1]
-        return loss + self.eikonal_weight * self.eikonal_loss(gt), torch.Tensor(psnrs)
+    def forward(self, pulse_data, gt, acc, wstd, target):
+        # Compute cosine similarity between pulses
+        loss = torch.sum(pulse_data * target, dim=-2) / (torch.linalg.norm(pulse_data, dim=-2) * torch.linalg.norm(target, dim=-2))
+        loss = 1 - torch.mean(torch.abs(loss))
+        # loss = ((pulse_data - target) ** 2).mean()
+        # loss = (torch.square(torch.abs(torch.view_as_complex(pulse_data)) - torch.abs(torch.view_as_complex(target)))).mean()
+        with torch.no_grad():
+            psnr = mse_to_psnr(loss)
+        # loss = self.coarse_weight_decay * loss
+        eik_loss = self.eikonal_loss(gt)
+        acc_loss = ((1 - acc)**2).mean()
+        std_loss = 10.
+        return loss + self.eikonal_weight * eik_loss + self.acc_weight * acc_loss + self.std_weight * std_loss, psnr, eik_loss, acc_loss, std_loss
 
     def eikonal_loss(self, grad_theta):
-        return ((grad_theta.norm(2, dim=1) - 1)**2).mean()
+        return (torch.square(grad_theta.norm(2, dim=1) - 1)).mean()
 
 
 def mse_to_psnr(mse):

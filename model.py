@@ -4,11 +4,11 @@ from typing import Optional, Union, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 from pytorch_lightning.utilities import grad_norm
-from torch import optim
+from torch import optim, Tensor
 from torch.optim import Optimizer
 from torch.distributed.fsdp.wrap import wrap
 from utils import sample_along_rays, resample_along_rays, volumetric_rendering, namedtuple_map, to8b, \
-    volumetric_scattering, get_sphere_intersection, distance_calculation, plot_grad_flow
+    volumetric_scattering, distance_calculation, plot_grad_flow, get_sphere_intersections
 from pytorch_lightning import LightningModule
 from util_modules import PositionalEncoding, MipLRDecay, NeRFLoss, SARNeRFLoss
 from tqdm import tqdm
@@ -228,7 +228,7 @@ def _xavier_init(model):
 
 
 class SARNeRF(LightningModule):
-    def __init__(self, config=None, return_raw: bool = False, *args: Any, **kwargs: Any):
+    def __init__(self, config=None, return_raw: bool = False, mfilt: np.array = None, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.config = config
         self.init_randomized = config.randomized
@@ -236,6 +236,7 @@ class SARNeRF(LightningModule):
         self.ray_shape = config.ray_shape
         self.num_levels = config.num_levels
         self.num_samples = config.num_samples
+        self.fine_samples = config.fine_samples
         self.density_input = (config.max_deg - config.min_deg) * 3 * 2
         self.params_input = 3 + ((config.viewdirs_max_deg - config.viewdirs_min_deg) * 3 * 2)
         self.density_noise = config.density_noise
@@ -246,7 +247,9 @@ class SARNeRF(LightningModule):
         self.wavelength = config.wavelength
         self.return_raw = return_raw
         self.automatic_optimization = False
-        self.scene_bounding_sphere = 100.0
+        self.scene_bounding_sphere = 1500.0
+        self.temperature = .01
+        self.mfilt = mfilt
 
         self.loss_function = SARNeRFLoss(config.coarse_weight_decay)
 
@@ -256,65 +259,104 @@ class SARNeRF(LightningModule):
 
         self.alpha = nn.Parameter(data=torch.Tensor([1.]), requires_grad=True)
         self.alpha_pos = nn.Softplus()
-        self.beta = nn.Parameter(data=torch.Tensor([.01]), requires_grad=True)
-        self.beta_pos = nn.Softplus()
+        self.beta = nn.Parameter(data=torch.Tensor([.1]), requires_grad=True)
+        self.beta_pos = nn.Sigmoid()
+        self.radar_scaling = nn.Parameter(data=torch.Tensor([1e3]), requires_grad=True)
+        self.scaling_pos = nn.Softplus()
+
+        self.approx_sign = nn.Sigmoid()
 
         _xavier_init(self)
 
-    def forward(self, ray_o, ray_d, ray_p, mfilt, radii, _near, _far, nsam, mpp, return_occ=False):
-        comp_rgbs = []
-        distances = []
-        sdfs = []
-        near = torch.zeros_like(radii, device=self.device)#  * _near[:, None]
-        far = torch.ones_like(radii, device=self.device)#  * _far[:, None]
-        pulse_bins = torch.arange(nsam - 1, device=self.device)[None, :] * mpp[:, None] + _near[:, None]
-        for l in range(self.num_levels):
-            # sample
-            if l == 0:  # coarse grain sample
+    def forward(self, ray_o, ray_d, ray_p, radii, _near, nsam, mpp, return_occ=False):
+        # Calculate sphere intersections for near and far
+        sph_intersections = get_sphere_intersections(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3), self.scene_bounding_sphere)
+        _far = _near + nsam * mpp
+        pulse_bins = torch.arange(nsam, dtype=torch.float32, device=self.device) * mpp + _near
+        data_range = _far - _near
+        near = torch.clamp_min((sph_intersections[:, 0].view(radii.shape) - _near) / data_range, 0.)
+        far = torch.clamp_max((sph_intersections[:, 1].view(radii.shape) - _near) / data_range, 1.)
+        # sample
+        for l in range(2):
+            if l == 0:
                 t_vals, (mean, var) = sample_along_rays(ray_o, ray_d, radii.unsqueeze(2), self.num_samples,
-                                                        near.unsqueeze(2), far.unsqueeze(2), randomized=self.randomized, lindisp=False,
-                                                        ray_shape=self.ray_shape)
-            else:  # fine grain sample/s
+                                                        near.unsqueeze(2), far.unsqueeze(2),
+                                                        randomized=False, lindisp=False, ray_shape=self.ray_shape)
+                sdf = self.sdf_network(mean, var)
+
+                # Laplace distribution CDF
+                density = self.laplace_cdf(sdf + self.density_bias).reshape((ray_o.shape[0], -1, self.num_samples, 1))
+            else:
                 t_vals, (mean, var) = resample_along_rays(ray_o, ray_d, radii.unsqueeze(2),
-                                                          t_vals.to(self.device),
-                                                          weights.to(self.device), randomized=self.randomized,
-                                                          stop_grad=True,
+                                                          t_vals.to(ray_o.device),
+                                                          weights.to(ray_o.device), randomized=False,
+                                                          stop_grad=True, num_samples=self.fine_samples + 1, resample_padding=.001,
                                                           ray_shape=self.ray_shape)
+                sdf = self.sdf_network(mean)
 
-            sdf = self.sdf_network(mean, var)
-            gradients = self.sdf_network.gradient(mean).detach()
-            normals = gradients / gradients.norm(2, -1, keepdim=True)
+                # Laplace distribution CDF
+                density = self.laplace_cdf(sdf + self.density_bias).reshape((ray_o.shape[0], -1, self.fine_samples, 1))
 
-            # predict params and reshape for use later
-            params = self.param_network(mean, var).reshape((ray_o.shape[0], -1, self.num_samples, 3))
 
-            # Laplace distribution CDF
-            # density = self.alpha_beta_pos(self.alpha) * (.5 + .5 * torch.sign(raw_density) * (1 - torch.exp(-torch.abs(raw_density) / self.alpha_beta_pos(self.beta))))
-            density = self.laplace_cdf(sdf + self.density_bias).reshape((ray_o.shape[0], -1, self.num_samples, 1))
-            # density = self.final_occ(self.density_activation(raw_density) + self.density_bias).reshape((ray_o.shape[0], -1, self.num_samples, 1))
-            distance, acc, weights, alpha, trans = distance_calculation(density, t_vals, ray_d)
-            distance = distance * (_far - _near) + _near
-            with torch.no_grad():
-                normals = torch.sum(weights.unsqueeze(-1) * normals, dim=2)
-                normals = normals / normals.norm(2, -1, keepdim=True)
+            t_mids = 0.5 * (t_vals[..., :-1] + t_vals[..., 1:])
+            t_dists = t_vals[..., 1:] - t_vals[..., :-1]
+            delta = t_dists * torch.linalg.norm(ray_d[..., None, :], dim=-1)
+            # Note that we're quietly turning density from [..., 0] to [...].
+            density_delta = density[..., 0] * delta
 
-            comp_rp = volumetric_scattering(params, weights, normals, distance, ray_d, pulse_bins, self.wavelength)
-            comp_rp = torch.fft.fft(torch.view_as_complex(comp_rp), mfilt.shape[-1], dim=-1)
-            comp_pulse = torch.fft.ifft(mfilt * comp_rp, dim=-1)[..., :nsam]
-            comp_pulse = comp_pulse / torch.std(comp_pulse, dim=-1)[..., None]
-            comp_pulse = torch.nan_to_num(torch.view_as_real(comp_pulse))
-            comp_rgbs.append(comp_pulse)
-            distances.append(distance)
-            sdfs.append(sdf.reshape((ray_o.shape[0], -1, self.num_samples, 1)))
+            alpha = 1 - torch.exp(-density_delta)
+            trans = torch.exp(-torch.cat([
+                torch.zeros_like(density_delta[..., :1]),
+                torch.cumsum(density_delta[..., :-1], dim=-1),
+            ], dim=-1))
+            # trans = torch.where(trans < .5, trans, 0.)
+            weights = alpha * trans
+
+        # predict params and reshape for use later
+        params = self.param_network(mean).reshape((ray_o.shape[0], -1, self.fine_samples, 2))
+        acc = torch.sum(weights, dim=-1)
+        weight_std = torch.std(weights, dim=-1)
+        distance = torch.sum(weights * t_mids, dim=-1) / acc
+        distance = torch.clamp(torch.nan_to_num(distance), t_vals[..., 0], t_vals[..., -1])
+        distance = distance * data_range + _near
+        params = torch.sum(weights[..., None] * params, dim=-2) / acc[..., None]
+
+        gradients = self.sdf_network.gradient(mean).detach()
+        with torch.no_grad():
+            normals = torch.sum(weights[..., None] * gradients, dim=-2) / acc[..., None]
+            normals = torch.nan_to_num(normals / normals.norm(2, -1, keepdim=True), 0)
+
+        bounce = normals * torch.sum(ray_d * normals, dim=-1)[..., None] * 2 - ray_d
+
+        '''ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
+            torch.abs(torch.sum(bounce * normals, dim=-1)) ** params[..., 2])) / distance ** 2'''
+        ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * (1 + self.scaling_pos(self.radar_scaling))
+        '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
+            torch.abs(torch.sum(bounce * normals, dim=-1)) ** params[..., 0])) / distance ** 2'''
+        '''ref_model = (torch.sum(-ray_d * normals, dim=-1) + torch.nan_to_num(
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2'''
+        # Calculate out expected phase as well
+        # indices = torch.stack([torch.bucketize(distance[d], pulse_bins) for d in range(ref_model.shape[0])])
+        # indices = torch.dstack([indices, indices])
+        bound_dist = torch.abs(distance.unsqueeze(-1) - pulse_bins.unsqueeze(0))
+        soft_buckets = torch.softmax(-bound_dist / self.temperature, dim=-1)
+        # Calculate out expected phase as well
+        ret = torch.view_as_real(ref_model * torch.exp(-2j * torch.pi / self.wavelength * distance * 2))
+        comp_pulse = ret[:, :, None, :] * soft_buckets[:, :, :, None]
+        comp_pulse = torch.sum(comp_pulse, dim=-3)
+        comp_pulse = torch.view_as_complex(comp_pulse)
+        comp_pulse = torch.fft.ifft(torch.fft.fft(comp_pulse, self.mfilt.shape[-1], dim=-1) * self.mfilt.to(self.device), dim=-1)[..., :nsam]
+        comp_pulse = torch.view_as_real(comp_pulse)
         if return_occ:
             return density
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
-            return torch.stack(comp_rgbs), torch.stack(distances), torch.stack(sdfs)
+            return comp_pulse, distance, sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1)), acc, weight_std
 
     def laplace_cdf(self, x):
-        return (.00001 + self.alpha_pos(self.alpha)) * (.5 + .5 * torch.sign(-x) * (
-                    1 - torch.exp(-torch.abs(x) / (.00001 + self.beta_pos(self.beta)))))
+        return (.00001 + self.alpha_pos(self.alpha)) * (.5 + .5 * (2 * self.approx_sign(-x) - 1) * (
+                    1 - torch.exp(-torch.abs(x) / (.1 + self.beta_pos(self.beta)))))
 
 
     def configure_optimizers(self):
@@ -334,23 +376,23 @@ class SARNeRF(LightningModule):
     def train_val_get(self, batch, do_train = True):
         if do_train:
             opt = self.optimizers()
-        ray_o, ray_d, ray_p, mfilt, radii, near, far, mpp, pulse_data = batch
+        ray_o, ray_d, ray_p, radii, near, mpp, pulse_data = batch
 
         # Generate rays for random sampling
-        pulses, dists, sdfs = self.forward(ray_o, ray_d, ray_p, mfilt, radii, near, far, pulse_data.shape[1], mpp)
+        pulses, dists, sdfs, acc, wstd = self.forward(ray_o, ray_d, ray_p, radii, near, pulse_data.shape[1], mpp)
 
         # Calculate out Eikonal loss
-        eik_pts = torch.empty(ray_o.shape[1], 3).uniform_(-self.scene_bounding_sphere, self.scene_bounding_sphere).to(
+        eik_pts = (torch.rand(size=(ray_o.shape[1], 3)) * -self.scene_bounding_sphere * 2 + self.scene_bounding_sphere).to(
             self.device)
-        eik_near_pts = ray_o + ray_d * dists[-1][..., None] + torch.randn(ray_o.shape, device=ray_o.device)
+        eik_near_pts = ray_o + ray_d * dists[..., None]
         eik_pts = torch.cat([eik_pts, eik_near_pts.squeeze(0)], dim=0)
         grad_theta = self.sdf_network.gradient(eik_pts)
 
-        train_loss, psnrs = self.loss_function(pulses, grad_theta, pulse_data)
+        train_loss, psnrs, eik_loss, acc_loss, std_loss = self.loss_function(pulses, grad_theta, acc, wstd, pulse_data)
 
         loss_name = 'train_loss' if do_train else 'val_loss'
-        self.log_dict({loss_name: train_loss, 'coarse_psnr': torch.mean(psnrs[:-1]), 'fine_psnr': psnrs[-1],
-                       'avg_psnr': torch.mean(psnrs), 'LR': self.lr_schedulers().get_last_lr()[0]}, on_epoch=True,
+        self.log_dict({loss_name: train_loss, 'eik_loss': eik_loss, 'psnr': psnrs,
+                       'acc_loss': acc_loss, 'std_loss': std_loss, 'lr': self.lr_schedulers().get_last_lr()[0]}, on_epoch=True,
                       prog_bar=True, rank_zero_only=True)
         if do_train:
 
@@ -362,6 +404,9 @@ class SARNeRF(LightningModule):
             opt.step()
             self.lr_schedulers().step()
 
+    # def on_fit_start(self) -> None:
+    #     self.logger.log_graph(self, self.example_input_array())
+
     def train(self, mode=True):
         self.randomized = self.init_randomized
         super().train(mode)
@@ -370,10 +415,6 @@ class SARNeRF(LightningModule):
     def eval(self):
         self.randomized = False
         return super().eval()
-
-    def gradient(self, x):
-        x.requires_grad_(True)
-        y = self.forward
 
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         norms = grad_norm(self, norm_type=2)  # Compute 2-norm for each layer
@@ -389,25 +430,15 @@ class SDFNetwork(LightningModule):
         self.positional_encoding = PositionalEncoding(min_deg, max_deg)
         self.sdf_net0 = nn.Sequential(
             nn.Linear(input_layer_sz, hidden),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
+            nn.ReLU(),
         )
         self.sdf_net1 = nn.Sequential(
             nn.Linear(input_layer_sz + hidden, hidden),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
+            nn.ReLU(),
         )
         self.final_sdf = nn.Sequential(
             nn.Linear(hidden, 1),
@@ -423,16 +454,11 @@ class SDFNetwork(LightningModule):
         new_encodings = self.sdf_net0(enc)
         new_encodings = torch.cat((new_encodings, enc), -1)
         new_encodings = self.sdf_net1(new_encodings)
-        raw_sdf = self.final_sdf(new_encodings)
-
-        # Clamp inside of bounding sphere
-        sphere_sdf = self.scene_bounding_sphere - raw_sdf.norm(2, 1, keepdim=True)
-        return torch.minimum(raw_sdf, sphere_sdf)
+        return self.final_sdf(new_encodings)
 
     def gradient(self, x):
         x.requires_grad_(True)
         y = self.forward(x)
-        y.requires_grad_(True)
         d_output = torch.ones_like(y, requires_grad=False, device=y.device)
         gradients = torch.autograd.grad(
             outputs=y,
@@ -452,28 +478,18 @@ class ParamNetwork(LightningModule):
         self.positional_encoding = PositionalEncoding(min_deg, max_deg)
         self.param_net0 = nn.Sequential(
             nn.Linear(input_layer_sz, hidden),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
+            nn.SiLU(),
         )
         self.param_net1 = nn.Sequential(
             nn.Linear(input_layer_sz + hidden, hidden),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
+            nn.SiLU(),
         )
         self.final_param = nn.Sequential(
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, 2),
             nn.Softplus(),
         )
 
@@ -487,7 +503,7 @@ class ParamNetwork(LightningModule):
         new_encodings = self.param_net0(enc)
         new_encodings = torch.cat((new_encodings, enc), -1)
         new_encodings = self.param_net1(new_encodings)
-        return self.final_param(new_encodings)
+        return self.final_param(new_encodings) + 1e-3
 
 def mse_to_psnr(mse):
     return -10.0 * torch.log10(mse)

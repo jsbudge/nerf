@@ -65,43 +65,33 @@ sarnerf_params:
     data_center: [40.093229, -111.768341, 1353.06885]
   # model hyperparams
   model:
-    use_viewdirs: True
-    randomized: False
-    ray_shape: cone  # should be "cylinder" if llff
-    override_defaults: True
-    num_levels: 2
     num_samples: 128
+    fine_samples: 128
     hidden: 256
     density_noise: 0.0
     density_bias: 0.0
-    rgb_padding: 0.0001
-    resample_padding: 0.001
     min_deg: 0
     max_deg: 8
-    viewdirs_min_deg: 0
-    viewdirs_max_deg: 4
     wavelength: 0.031228381041666666
-    accumulation_steps: 1
+    az_bw: 0.039269908169872414
+    el_bw: 0.09599310885968812
   # loss and optimizer hyperparams
   loss:
     coarse_weight_decay: 0.1
     lr_init: .001
     lr_final: .00005
-    lr_delay_steps: 17500
-    lr_delay_mult: 0.1
-    weight_decay: 0.0
+    lr_delay_steps: 1500
+    lr_delay_mult: 0.5
+    weight_decay: 0.01
   # training hyperparams
   training:
-    factor: 2
     split: .7
-    max_epochs: 2500
+    max_epochs: 10
+    max_steps: -1
     batch_size: 1
-    do_eval: False
-    continue_training: True
-    save_every: 1000
     device: cuda
-    az_samples: 32
-    el_samples: 32
+    az_samples: 48
+    el_samples: 48
     num_workers: 0
     single_example: False
     distributed: False

@@ -526,8 +526,7 @@ class SDRPulseDataset(Dataset):
             Xs = idxes
 
         i_vals = Xs if is_val else Xt
-        rp = SDRPlatform(sdr_f, origin=data_center, channel=0)
-        rp.fs = sdr_f[0].fs
+        rp = SDRPlatform(sdr_f, origin=data_center, channel=0, fs=sdr_f[0].fs)
         self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[i_vals]), dtype=torch.float)
         self.pans = rp.pan(sdr_f[0].pulse_time[i_vals])
         self.tilts = rp.tilt(sdr_f[0].pulse_time[i_vals])
@@ -535,30 +534,32 @@ class SDRPulseDataset(Dataset):
         self.pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
                                   sdr_f.genMatchedFilter(0, fft_len=fft_sz), axis=1)[:, :sdr_f[0].nsam]
         # Normalize pulses so that they have a standard deviation of one
-        self.pulses = self.pulses / np.std(self.pulses, axis=-1)[:, None]
+        self.pulses = self.pulses / np.std(self.pulses)
         self.pulses = torch.view_as_real(torch.tensor(self.pulses))
         self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz))
-        near, far = rp.calcRanges(5.0, .75)
+        self.near, _ = rp.calcRanges(5.0, .75)
+        self.near = np.float32(self.near)
+        self.mpp = np.float32(c0 / rp.fs / 2)
 
-        azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw, rp.az_half_bw, az_samples), np.linspace(-rp.el_half_bw, rp.el_half_bw, el_samples))
+        # azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw * 3, rp.az_half_bw * 3, az_samples),
+        #                          np.linspace(-rp.el_half_bw * 2, rp.el_half_bw * 2, el_samples))
+        azes = np.random.rand(az_samples * el_samples) * 4 * rp.az_half_bw - 2 * rp.az_half_bw
+        eles = np.random.rand(az_samples * el_samples) * 4 * rp.el_half_bw - 2 * rp.el_half_bw
         self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
         dx = torch.sqrt(torch.sum((self.pvecs[:-1] - self.pvecs[1:]) ** 2, dim=-1))
         dx = torch.cat([dx, dx[-2:-1]], 0)
         radii = dx
-        ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2 * 10
-        ray_mask = ray_p > 1e-9
+        ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2
+        ray_mask = ray_p > 1e-60
         self.pvecs = self.pvecs[ray_mask]
         self.radii = radii[ray_mask]
         self.ray_p = ray_p[ray_mask]
-        self.near = np.float32(near)
-        self.far = np.float32(far)
-        self.mpp = c0 / rp.fs / 2
 
 
-    def __getitem__(self, idx):
-        ray_d = self.pvecs @ rot_roll(self.tilts[idx]) @ rot_yaw(self.pans[idx])
-        return (torch.outer(torch.ones_like(self.radii), self.pos[idx]), ray_d, self.ray_p, self.mfilt, self.radii,
-                self.near, self.far, self.mpp, self.pulses[idx])
+    def __getitem__(self, p_idx):
+        ray_d = self.pvecs @ rot_roll(self.tilts[p_idx]) @ rot_yaw(self.pans[p_idx])
+        return (torch.outer(torch.ones_like(self.radii), self.pos[p_idx]), ray_d, self.ray_p, self.radii,
+                self.near, self.mpp, self.pulses[p_idx])
 
     def __len__(self):
         return self.pulses.shape[0]
