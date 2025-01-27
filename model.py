@@ -258,7 +258,7 @@ class SARNeRF(LightningModule):
         self.param_network = ParamNetwork(config.min_deg, config.max_deg, config.hidden, self.density_input)
 
         self.alpha = nn.Parameter(data=torch.Tensor([1.]), requires_grad=True)
-        self.alpha_pos = nn.Softplus()
+        self.alpha_pos = nn.Softmax()
         self.beta = nn.Parameter(data=torch.Tensor([.1]), requires_grad=True)
         self.beta_pos = nn.Sigmoid()
         self.radar_scaling = nn.Parameter(data=torch.Tensor([1e3]), requires_grad=True)
@@ -399,7 +399,7 @@ class SARNeRF(LightningModule):
 
             opt.zero_grad()
             self.manual_backward(train_loss, retain_graph=True)
-            # self.clip_gradients(opt, gradient_clip_val=.5, gradient_clip_algorithm='norm')
+            self.clip_gradients(opt, gradient_clip_val=50, gradient_clip_algorithm='norm')
             # plot_grad_flow(self.named_parameters())
             opt.step()
             self.lr_schedulers().step()

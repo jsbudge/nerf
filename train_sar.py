@@ -59,7 +59,7 @@ if __name__ == '__main__':
         trainer = Trainer(logger=logger, max_epochs=config.max_epochs, devices=2, detect_anomaly=True, overfit_batches=2,
                           strategy=FSDPStrategy(sharding_strategy='SHARD_GRAD_OP'))
     else:
-        trainer = Trainer(logger=logger, max_steps=config.max_steps, max_epochs=config.max_epochs, detect_anomaly=False,
+        trainer = Trainer(logger=logger, max_steps=config.max_steps, max_epochs=config.max_epochs, detect_anomaly=True,
                           devices=[0], num_sanity_val_steps=0, check_val_every_n_epoch=10)
 
     print('Loading model...')

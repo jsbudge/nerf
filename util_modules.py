@@ -81,7 +81,7 @@ class SARNeRFLoss(torch.nn.modules.loss._Loss):
 
     def forward(self, pulse_data, gt, acc, wstd, target):
         # Compute cosine similarity between pulses
-        loss = torch.sum(pulse_data * target, dim=-2) / (torch.linalg.norm(pulse_data, dim=-2) * torch.linalg.norm(target, dim=-2))
+        loss = torch.nan_to_num(torch.sum(pulse_data * target, dim=-2) / (torch.linalg.norm(pulse_data, dim=-2) * torch.linalg.norm(target, dim=-2)), 1e9)
         loss = 1 - torch.mean(torch.abs(loss))
         # loss = ((pulse_data - target) ** 2).mean()
         # loss = (torch.square(torch.abs(torch.view_as_complex(pulse_data)) - torch.abs(torch.view_as_complex(target)))).mean()
