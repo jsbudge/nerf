@@ -8,21 +8,14 @@ import plotly.express as px
 import plotly.io as pio
 import plotly.graph_objects as go
 from pytorch_lightning.strategies import FSDPStrategy
-import os
-
+from simulib.grid_helper import SDREnvironment
 from simulib.simulation_functions import azelToVec
-from tqdm import tqdm
-
-from utils import rot_roll, rot_yaw
-
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
 from config import get_config
 from dataloader import SARNeRFModule
 from model import SARNeRF
 import matplotlib.pyplot as plt
 import open3d as o3d
-c0 = 3e8
+import matplotlib as mplib
 
 pio.renderers.default = 'browser'
 
@@ -49,23 +42,52 @@ if __name__ == '__main__':
     else:
         seed_everything(np.random.randint(1, 2048), workers=True)
 
+    from simulib.simulation_functions import enu2llh, llh2enu, db
+
+    sdr_f = load(config.sdr_file)
+    rp = SDRPlatform(sdr_f, origin=config.data_center, fs=sdr_f[0].fs)
+
+    nsam, nr, ranges, ranges_sampled, near_range_s, granges, fft_len, up_fft_len = (
+        rp.getRadarParams(5., .75, 1))
+    # Calculate out ground ranges for sphere intersections
+    av_hght = rp.pos(rp.gpst).mean(axis=0)[2]
+    near_grange = granges[0]
+    far_grange = granges[-1]
+    sph_inter = (far_grange - near_grange)
+
+    bg = SDREnvironment(sdr_f, origin=config.data_center)
+    gx, gy, gz = bg.getGrid(config.data_center, sph_inter, sph_inter, 80, 80)
+    # Shift position
+    glat, glon, galt = enu2llh(gx.flatten(), gy.flatten(), gz.flatten(), bg.ref)
+    gx, gy, gz = llh2enu(glat, glon, galt, rp.origin)
+
+
+
+    # Only get the ones inside the scene sphere
+    gpts = np.dstack((gx, gy, gz))[0]
+    gpts = gpts[np.linalg.norm(gpts[:, :2], axis=1) < sph_inter]
+    bounding_box = np.array([[gpts[:, 0].min() - 10, gpts[:, 1].min() - 10, gpts[:, 2].min() - 10],
+                             [gpts[:, 0].max() + 10, gpts[:, 1].max() + 10, gpts[:, 2].max() + 10]])
+
     print('Loading data...')
     data = SARNeRFModule(config=config)
     data.setup()
-    logger = loggers.TensorBoardLogger(config.log_dir, name="SARNeRF", log_graph=True)
+    logger = loggers.TensorBoardLogger(config.log_dir, name="SARNeRF", version=0, log_graph=True)
 
     print('Building trainer...')
     if config.distributed:
-        trainer = Trainer(logger=logger, max_epochs=config.max_epochs, devices=2, detect_anomaly=True, overfit_batches=2,
-                          strategy=FSDPStrategy(sharding_strategy='SHARD_GRAD_OP'))
+        trainer = Trainer(logger=logger, max_epochs=config.max_epochs, devices=2, detect_anomaly=False, overfit_batches=2,
+                          strategy=FSDPStrategy(sharding_strategy='SHARD_GRAD_OP'), num_sanity_val_steps=0,
+                          check_val_every_n_epoch=100)
     else:
-        trainer = Trainer(logger=logger, max_steps=config.max_steps, max_epochs=config.max_epochs, detect_anomaly=True,
-                          devices=[0], num_sanity_val_steps=0, check_val_every_n_epoch=10)
+        trainer = Trainer(logger=logger, max_steps=config.max_steps, max_epochs=config.max_epochs, detect_anomaly=False,
+                          devices=[0], num_sanity_val_steps=0, check_val_every_n_epoch=20000)
 
     print('Loading model...')
     model = SARNeRF(
         config=config,
-        mfilt=data.train_dataset.mfilt,
+        eik_loss_baseline=gpts,
+        scene_bbox=bounding_box,
     )
     model.train()
 
@@ -79,32 +101,35 @@ if __name__ == '__main__':
 
 
     print('Rendering pulse...')
+    mplib.use('TkAgg')
     model.eval()
     model.to(device)
 
+    # Generate points from sphere for sampling the function
+    pts = torch.cat([model.eik_base, torch.rand(size=(model.eik_base.shape[0], 3)) * np.diff(model.scene_bbox, axis=0) + model.scene_bbox[0]], dim=0).to(model.device)
+
+    sdf_test, norm_test = model.sample_density_function(pts=pts)
+    density_test = model.laplace_cdf(sdf_test).cpu().data.numpy().flatten()
+    norm_test = norm_test.cpu().data.numpy().reshape(-1, 3)
+    sdf_test = sdf_test.cpu().data.numpy().flatten()
+
+    pts_np = pts.cpu().data.numpy()
+    ax = plt.figure('Normals').add_subplot(projection='3d')
+    ax.quiver(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], norm_test[:, 0] * density_test * 50., norm_test[:, 1] * density_test * 50., norm_test[:, 2] * density_test * 50.)
+    plt.show()
+
+    ax = plt.figure('Density').add_subplot(projection='3d')
+    ax.scatter(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], s=density_test)
+    plt.show()
+
     # Build out the pulse
-    rays_o, rays_d, rays_p, radii, bins, mpp, target = next(iter(data.train_dataloader()))
-    pulse, dist_tensor, sdf_tensor, acc_tensor, std_tensor = model(rays_o.to(model.device), rays_d.to(model.device), rays_p.to(model.device),
-                             radii.to(model.device), bins.to(model.device),
-                             target.shape[1], mpp.to(model.device))
+    ray_info, target = next(iter(data.train_dataloader()))
+    pulse, dist_tensor, sdf_tensor, acc_tensor, weight_tensor = model(ray_info.to(model.device))
     np_pulse = torch.view_as_complex(pulse).cpu().data.numpy()[0]
     np_target = torch.view_as_complex(target).cpu().data.numpy()[0]
     distances = dist_tensor[0].cpu().data.numpy()
-    sdf = sdf_tensor[0].cpu().data.numpy()
+    densities = model.laplace_cdf(sdf_tensor)
 
-
-
-    # fig = px.scatter_3d(x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], size=density.flatten()).show()
-
-    from simulib.grid_helper import SDREnvironment
-    from simulib.simulation_functions import enu2llh, llh2enu
-    sdr_f = load(config.sdr_file)
-    rp = SDRPlatform(sdr_f, origin=config.data_center, fs=sdr_f[0].fs)
-    bg = SDREnvironment(sdr_f, origin=config.data_center)
-    gx, gy, gz = bg.getGrid(config.data_center, 2000, 2000, 100, 100)
-    # Shift position
-    glat, glon, galt = enu2llh(gx.flatten(), gy.flatten(), gz.flatten(), bg.ref)
-    gx, gy, gz = llh2enu(glat, glon, galt, rp.origin)
     nsam, nr, ranges, ranges_sampled, near_range_s, granges, fft_len, up_fft_len = (
             rp.getRadarParams(5., .75, 1))
 
@@ -113,88 +138,64 @@ if __name__ == '__main__':
 
     plt.figure()
     plt.subplot(3, 1, 1)
-    plt.plot(ranges, np_pulse.real)
+    plt.plot(ranges, abs(np_pulse))
     plt.subplot(3, 1, 2)
-    plt.plot(ranges, np_target.real)
+    plt.plot(ranges, abs(np_target))
     plt.subplot(3, 1, 3)
-    plt.plot(ranges, test.real)
+    plt.plot(ranges, abs(test))
     plt.show()
-    
 
-    
-    flight_path = rp.txpos(rp.gpst)
-    bores = rp.boresight(rp.gpst)
-    ray_points = (rays_o[0, :, :] + rays_d[0, :, :] * distances[:, None]).cpu().data.numpy()
-    beampattern = (rays_o[0, :, :] + rays_d[0, :, :] * distances.mean()).cpu().data.numpy()
-    trace_angle = azelToVec(torch.arctan2(rays_d[0, :, 0], rays_d[0, :, 1]).mean().cpu().data.numpy(), -torch.arcsin(rays_d[0, :, 2]).mean().cpu().data.numpy())
-    ray_trace = (rays_o[0, :2, :] + trace_angle[None, :] * ranges[::nsam-1][:, None]).cpu().data.numpy()
+    # Generate random rays for sampling
+    ray_d, ray_o, ray_p = model.generate_rays(ray_info.to(model.device))
+    # Calculate sphere intersections for near and far
+    bb_enter, bb_leave, misses = model.bb_intersect(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3))
+    tilts = np.arcsin(-ray_d[0, misses, 2].cpu().data.numpy())
+
+    flight_path = data.train_dataset.pos
+    ray_points = (ray_o[0, misses].cpu().data.numpy() + ray_d[0, misses].cpu().data.numpy() * distances[:, None])
+    beampattern = ray_info[:, :3].detach().numpy() + ray_d[0, misses].cpu().data.numpy() * (ray_info[:, 2].detach().numpy() / np.sin(tilts))[:, None]
+    trace_angle = azelToVec(np.arctan2(ray_d[0, :, 0].cpu().data.numpy(), ray_d[0, :, 1].cpu().data.numpy()).mean(), -np.arcsin(ray_d[0, :, 2].cpu().data.numpy()).mean())
+    ray_trace = (ray_info[:, :3].detach() + trace_angle[None, :] * ranges[::nsam-1][:, None]).cpu().data.numpy()
+    ray_size = db(model.ray_p[0, misses.cpu()].cpu().data.numpy().flatten())
+    ray_size += abs(ray_size.min())
     fig = px.scatter_3d(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2])
-    # fig.add_trace(go.Cone(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2], u=bores[:, 0],
-    #                       v=bores[:, 1], w=bores[:, 2], anchor='tail', sizeref=55, sizemode='absolute'))
-    # fig.add_trace(go.Cone(x=rays_o[0, :, 0], y=rays_o[0, :, 1], z=rays_o[0, :, 2], u=rays_d[0, :, 0],
-    #                       v=rays_d[0, :, 1], w=rays_d[0, :, 2], anchor='tail', sizeref=55, sizemode='absolute'))
-    fig.add_trace(go.Scatter3d(x=gx, y=gy, z=gz))
+    fig.add_trace(go.Scatter3d(x=gpts[:, 0], y=gpts[:, 1], z=gpts[:, 2], mode='markers', marker=dict(opacity=.5)))
     fig.add_trace(go.Scatter3d(x=ray_points[:, 0], y=ray_points[:, 1], z=ray_points[:, 2], mode='markers'))
-    fig.add_trace(go.Scatter3d(x=beampattern[:, 0], y=beampattern[:, 1], z=beampattern[:, 2], mode='markers'))
+    fig.add_trace(go.Scatter3d(x=beampattern[:, 0], y=beampattern[:, 1], z=beampattern[:, 2], marker=dict(size=ray_size / ray_size.max() * 1e1), mode='markers'))
     fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))
     fig.update_layout(
         scene=dict(xaxis=dict(range=[flight_path[:, 0].min(), flight_path[:, 0].max()]),
                    yaxis=dict(range=[flight_path[:, 1].min(), flight_path[:, 1].max()]),
-                   zaxis=dict(range=[beampattern[:, 2].min() - 10, flight_path[:, 2].max() + 100])),
+                   zaxis=dict(range=[min(beampattern[:, 2].min(), gpts[:, 2].min(), ray_points[:, 2].min()) - 10, flight_path[:, 2].max() + 100])),
     )
     fig.show()
 
-    '''gx, gy, gz = np.meshgrid(np.linspace(-500, 500, 10),np.linspace(-500, 500, 10), np.linspace(-500, 500, 10))
+    # BBOx intersections
+    from simulib.mesh_functions import drawOctreeBox
+    bbox = drawOctreeBox(model.scene_bbox)
 
-    fig = px.scatter_3d(x=gx.flatten(), y=gy.flatten(), z=gz.flatten())
-    fig.add_trace(go.Cone(x=rays_o[0, :, 0], y=rays_o[0, :, 1], z=rays_o[0, :, 2], u=rays_d[0, :, 0],
-                          v=rays_d[0, :, 1], w=rays_d[0, :, 2], anchor='tail', sizeref=55, sizemode='absolute'))
-    fig.show()'''
 
-    '''model.to(device)
+    bb_enter_pos = (ray_o + ray_d * bb_enter[..., None]).cpu().data.numpy()
+    bb_leave_pos = (ray_o + ray_d * bb_leave[..., None]).cpu().data.numpy()
+    misses = misses.cpu().data.numpy()
 
-    xmin, xmax = config.x_range
-    ymin, ymax = config.y_range
-    zmin, zmax = config.z_range
-    x = np.linspace(xmin, xmax, config.grid_size)
-    y = np.linspace(ymin, ymax, config.grid_size)
-    z = np.linspace(zmin, zmax, config.grid_size)
-    origins = torch.FloatTensor(np.stack(np.meshgrid(x, y, z), -1).reshape(1, -1, 3))
-    directions = torch.zeros_like(origins)
-    ray_p = torch.ones_like(origins[..., :1])
-    radii = torch.ones_like(origins[..., :1]) * 0.0005
+    fig = px.scatter_3d(x=bb_enter_pos[0, misses, 0], y=bb_enter_pos[0, misses, 1], z=bb_enter_pos[0, misses, 2])
+    fig.add_trace(go.Scatter3d(x=bb_leave_pos[0, misses, 0], y=bb_leave_pos[0, misses, 1], z=bb_leave_pos[0, misses, 2],
+                               mode='markers'))
+    fig.add_trace(bbox)
 
-    print("Predicting occupancy")
-    raws = []
-    with torch.no_grad():
-        for i in tqdm(range(0, origins.shape[1], config.chunks)):
-            img, dist, acc, raw = model(origins[:, i:i + config.chunks].to(model.device),
-                                        directions[:, i:i + config.chunks].to(model.device), ray_p[:, i:i + config.chunks].to(model.device),
-                             mfilt.to(model.device), radii[:, i:i + config.chunks].to(model.device), near.to(model.device),
-                             far.to(model.device), target.shape[1], mpp.to(model.device))
-            raws.append(torch.mean(raw, dim=1).cpu())
-    sigma = torch.cat(raws, dim=0)
-    sigma = np.maximum(sigma[:, -1].cpu().numpy(), 0)
-    sigma = sigma.reshape(config.grid_size, config.grid_size, config.grid_size)
-    print("Extracting mesh")
-    print("fraction occupied", np.mean(np.array(sigma > config.sigma_threshold), dtype=np.float32))
-    vertices, triangles = mcubes.marching_cubes(sigma, config.sigma_threshold)
-    vertices_ = (vertices / config.sigma_threshold).astype(np.float32)'''
-    '''x_ = (ymax - ymin) * vertices_[:, 1] + ymin
-    y_ = (xmax - xmin) * vertices_[:, 0] + xmin
-    vertices_[:, 0] = x_
-    vertices_[:, 1] = y_
-    vertices_[:, 2] = (zmax - zmin) * vertices_[:, 2] + zmin
-    vertices_.dtype = [("x", "f4"), ("y", "f4"), ("z", "f4")]
-    face = np.empty(len(triangles), dtype=[('vertex_indices', 'i4', (3,))])
-    face["vertex_indices"] = triangles
-    mesh_path = path.join(config.log_dir, "mesh.ply")
-    PlyData([PlyElement.describe(vertices_[:, 0], "vertex"), PlyElement.describe(face, "face")]).write(mesh_path)
-    mesh = o3d.io.read_triangle_mesh(mesh_path)
-    print(f"Mesh has {len(mesh.vertices) / 1e6:.2f} M vertices and {len(mesh.triangles) / 1e6:.2f} M faces.")'''
+    '''for n in range(misses.shape[0]):
+        if not misses[n]:
+            trace_angle = azelToVec(np.arctan2(ray_d[n, 0], ray_d[n, 1]), -np.arcsin(ray_d[n, 2]))
+            ray_trace = (ray_info[:, :3].detach() + trace_angle[None, :] * ranges[::nsam - 1][:, None]).cpu().data.numpy()
+            fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))'''
+    fig.show()
 
-    # mesh = o3d.io.read_triangle_mesh('./render_output.obj')
-    # o3d.visualization.draw_plotly([mesh])
+    sdf_cubes, _ = model.sample_density_function([gx.min(), gx.max()], [gy.min(), gy.max()], [gz.min(), gz.max()], [50, 50, 50])
+    vertices, triangles = mcubes.marching_cubes(sdf_cubes.cpu().data.numpy(), sdf_cubes.mean())
+
+    fig = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2])])
+    fig.show()
 
 
 

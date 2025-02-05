@@ -735,14 +735,13 @@ def get_sphere_intersections(cam_loc, ray_directions, r = 1.0):
     under_sqrt = ray_cam_dot ** 2 - (cam_loc.norm(2, 1, keepdim=True) ** 2 - r ** 2)
 
     # sanity check
-    if (under_sqrt <= 0).sum() > 0:
-        print('BOUNDING SPHERE PROBLEM!')
-        exit()
+    misses = under_sqrt <= 0
+    under_sqrt[misses] = 0
 
-    sphere_intersections = torch.sqrt(under_sqrt) * torch.Tensor([-1, 1]).cuda().float() - ray_cam_dot
+    sphere_intersections = torch.sqrt(under_sqrt) * torch.tensor([-1, 1], device=under_sqrt.device).float() - ray_cam_dot
     sphere_intersections = sphere_intersections.clamp_min(0.0)
 
-    return sphere_intersections
+    return sphere_intersections, misses
 
 
 def plot_grad_flow(named_parameters):
@@ -788,3 +787,6 @@ def make_dot(var):
 
     add_nodes(var.creator)
     return dot
+
+def eikonal_loss(grad_theta):
+    return (torch.square(grad_theta.norm(2, dim=1) - 1)).mean()

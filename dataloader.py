@@ -16,7 +16,7 @@ import json
 import numpy as np
 from PIL import Image
 import torch
-from utils import Rays, convert_to_ndc, namedtuple_map, rot_yaw, rot_roll
+from utils import Rays, convert_to_ndc, namedtuple_map, rot_yaw, rot_roll, get_sphere_intersections
 from utils import normalize, look_at, poses_avg, recenter_poses, to_float, generate_spiral_cam_to_world, generate_spherical_cam_to_world, flatten
 from torch.utils.data import Dataset, DataLoader
 
@@ -511,13 +511,13 @@ class NeRFModule(LightningDataModule):
 
 
 class SDRPulseDataset(Dataset):
-    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, az_samples: int = 32,
-                 el_samples: int = 32, distributed: bool = False, is_val: bool = False, seed: int = 42):
+    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, distributed: bool = False,
+                 is_val: bool = False, seed: int = 42):
         if distributed:
             sdr_f = load(sdr_file, import_pickle=False, export_pickle=False)
         else:
             sdr_f = load(sdr_file)
-        idxes = np.arange(sdr_f[0].nframes)[::5]
+        idxes = np.arange(sdr_f[0].nframes)[::100]
 
         if split < 1:
             Xs, Xt = train_test_split(idxes, test_size=split, random_state=seed)
@@ -527,59 +527,47 @@ class SDRPulseDataset(Dataset):
 
         i_vals = Xs if is_val else Xt
         rp = SDRPlatform(sdr_f, origin=data_center, channel=0, fs=sdr_f[0].fs)
-        self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[i_vals]), dtype=torch.float)
-        self.pans = rp.pan(sdr_f[0].pulse_time[i_vals])
-        self.tilts = rp.tilt(sdr_f[0].pulse_time[i_vals])
         fft_sz = findPowerOf2(sdr_f[0].nsam + sdr_f[0].pulse_length)
         self.pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
                                   sdr_f.genMatchedFilter(0, fft_len=fft_sz), axis=1)[:, :sdr_f[0].nsam]
         # Normalize pulses so that they have a standard deviation of one
+        pulse_std = self.pulses.std(axis=1)
+        valids = abs(pulse_std - pulse_std.mean()) <= pulse_std.std()
+        self.pulses = self.pulses[valids]
         self.pulses = self.pulses / np.std(self.pulses)
         self.pulses = torch.view_as_real(torch.tensor(self.pulses))
-        self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz))
-        self.near, _ = rp.calcRanges(5.0, .75)
-        self.near = np.float32(self.near)
-        self.mpp = np.float32(c0 / rp.fs / 2)
 
-        # azes, eles = np.meshgrid(np.linspace(-rp.az_half_bw * 3, rp.az_half_bw * 3, az_samples),
-        #                          np.linspace(-rp.el_half_bw * 2, rp.el_half_bw * 2, el_samples))
-        azes = np.random.rand(az_samples * el_samples) * 4 * rp.az_half_bw - 2 * rp.az_half_bw
-        eles = np.random.rand(az_samples * el_samples) * 4 * rp.el_half_bw - 2 * rp.el_half_bw
-        self.pvecs = torch.tensor(azelToVec(azes.flatten(), eles.flatten()).T, dtype=torch.float)
-        dx = torch.sqrt(torch.sum((self.pvecs[:-1] - self.pvecs[1:]) ** 2, dim=-1))
-        dx = torch.cat([dx, dx[-2:-1]], 0)
-        radii = dx
-        ray_p = np.sinc(azes.flatten() / rp.az_half_bw)**2 * np.sinc(eles.flatten() / rp.el_half_bw)**2
-        ray_mask = ray_p > 1e-60
-        self.pvecs = self.pvecs[ray_mask]
-        self.radii = radii[ray_mask]
-        self.ray_p = ray_p[ray_mask]
+        new_ivals = i_vals[valids]
+        self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float)
+        self.pans = torch.tensor(rp.pan(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
+        self.tilts = torch.tensor(rp.tilt(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
+
+        # Concatenate data for easier use
+        self.data = torch.cat([self.pos, self.pans.unsqueeze(-1), self.tilts.unsqueeze(-1)], dim=-1)
+        # self.data.requires_grad_(True)
 
 
     def __getitem__(self, p_idx):
-        ray_d = self.pvecs @ rot_roll(self.tilts[p_idx]) @ rot_yaw(self.pans[p_idx])
-        return (torch.outer(torch.ones_like(self.radii), self.pos[p_idx]), ray_d, self.ray_p, self.radii,
-                self.near, self.mpp, self.pulses[p_idx])
+        return self.data[p_idx], self.pulses[p_idx]
 
     def __len__(self):
-        return self.pulses.shape[0]
+        return self.data.shape[0]
 
 
 class SARNeRFModule(LightningDataModule):
-    def __init__(self, config):
+    def __init__(self, config, sphere_intersection: float = 1500.):
         super().__init__()
         self.config = config
         self.train_dataset = None
         self.val_dataset = None
+        self.sph_inter = sphere_intersection
 
     def setup(self, stage: Optional[str] = None) -> None:
         self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center, az_samples = self.config.az_samples,
-                 el_samples = self.config.el_samples, distributed = self.config.distributed, is_val=False, seed=42)
+                                             data_center = self.config.data_center, distributed = self.config.distributed, is_val=False, seed=42)
 
         self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center, az_samples = self.config.az_samples,
-                 el_samples = self.config.el_samples, distributed = self.config.distributed, is_val=True, seed=42)
+                                             data_center = self.config.data_center, distributed = self.config.distributed, is_val=True, seed=42)
 
 
     def train_dataloader(self) -> DataLoader:
