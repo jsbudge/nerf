@@ -123,8 +123,8 @@ if __name__ == '__main__':
     plt.show()
 
     # Build out the pulse
-    ray_info, target = next(iter(data.train_dataloader()))
-    pulse, dist_tensor, sdf_tensor, acc_tensor, weight_tensor = model(ray_info.to(model.device))
+    ray_d, ray_o, ray_p, target = next(iter(data.train_dataloader()))
+    pulse, dist_tensor, sdf_tensor, acc_tensor, weight_tensor = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device))
     np_pulse = torch.view_as_complex(pulse).cpu().data.numpy()[0]
     np_target = torch.view_as_complex(target).cpu().data.numpy()[0]
     distances = dist_tensor[0].cpu().data.numpy()
@@ -145,23 +145,22 @@ if __name__ == '__main__':
     plt.plot(ranges, abs(test))
     plt.show()
 
-    # Generate random rays for sampling
-    ray_d, ray_o, ray_p = model.generate_rays(ray_info.to(model.device))
     # Calculate sphere intersections for near and far
-    bb_enter, bb_leave, misses = model.bb_intersect(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3))
-    tilts = np.arcsin(-ray_d[0, misses, 2].cpu().data.numpy())
+    bb_enter, bb_leave, misses = model.bb_intersect(ray_o.reshape(-1, 3).to(model.device), ray_d.reshape(-1, 3).to(model.device))
+    misses = misses.to(ray_d.device)
+    tilts = np.arcsin(-ray_d[0, :, 2].cpu().data.numpy())
 
     flight_path = data.train_dataset.pos
     ray_points = (ray_o[0, misses].cpu().data.numpy() + ray_d[0, misses].cpu().data.numpy() * distances[:, None])
-    beampattern = ray_info[:, :3].detach().numpy() + ray_d[0, misses].cpu().data.numpy() * (ray_info[:, 2].detach().numpy() / np.sin(tilts))[:, None]
+    beampattern = ray_o[0].detach().numpy() + ray_d[0].cpu().data.numpy() * (ray_o[0, :, 2].detach().numpy() / np.sin(tilts))[:, None]
     trace_angle = azelToVec(np.arctan2(ray_d[0, :, 0].cpu().data.numpy(), ray_d[0, :, 1].cpu().data.numpy()).mean(), -np.arcsin(ray_d[0, :, 2].cpu().data.numpy()).mean())
-    ray_trace = (ray_info[:, :3].detach() + trace_angle[None, :] * ranges[::nsam-1][:, None]).cpu().data.numpy()
-    ray_size = db(model.ray_p[0, misses.cpu()].cpu().data.numpy().flatten())
-    ray_size += abs(ray_size.min())
+    ray_trace = (ray_o[0, 0].detach() + trace_angle[None, :] * ranges[::nsam-1][:, None]).cpu().data.numpy()
+    ray_size = db(ray_p[0].cpu().data.numpy().flatten())
+    ray_size = (ray_size - ray_size.min()) / (ray_size.max() - ray_size.min()) * 50
     fig = px.scatter_3d(x=flight_path[:, 0], y=flight_path[:, 1], z=flight_path[:, 2])
     fig.add_trace(go.Scatter3d(x=gpts[:, 0], y=gpts[:, 1], z=gpts[:, 2], mode='markers', marker=dict(opacity=.5)))
     fig.add_trace(go.Scatter3d(x=ray_points[:, 0], y=ray_points[:, 1], z=ray_points[:, 2], mode='markers'))
-    fig.add_trace(go.Scatter3d(x=beampattern[:, 0], y=beampattern[:, 1], z=beampattern[:, 2], marker=dict(size=ray_size / ray_size.max() * 1e1), mode='markers'))
+    fig.add_trace(go.Scatter3d(x=beampattern[:, 0], y=beampattern[:, 1], z=beampattern[:, 2], marker=dict(size=ray_size), mode='markers'))
     fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))
     fig.update_layout(
         scene=dict(xaxis=dict(range=[flight_path[:, 0].min(), flight_path[:, 0].max()]),
@@ -175,8 +174,8 @@ if __name__ == '__main__':
     bbox = drawOctreeBox(model.scene_bbox)
 
 
-    bb_enter_pos = (ray_o + ray_d * bb_enter[..., None]).cpu().data.numpy()
-    bb_leave_pos = (ray_o + ray_d * bb_leave[..., None]).cpu().data.numpy()
+    bb_enter_pos = (ray_o + ray_d * bb_enter[..., None].to(ray_o.device)).cpu().data.numpy()
+    bb_leave_pos = (ray_o + ray_d * bb_leave[..., None].to(ray_o.device)).cpu().data.numpy()
     misses = misses.cpu().data.numpy()
 
     fig = px.scatter_3d(x=bb_enter_pos[0, misses, 0], y=bb_enter_pos[0, misses, 1], z=bb_enter_pos[0, misses, 2])

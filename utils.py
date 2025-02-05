@@ -5,6 +5,7 @@ import matplotlib.cm as cm
 from graphviz import Digraph
 from matplotlib import pyplot as plt
 from scipy import signal
+from torch import Tensor
 from torch.autograd import Variable
 
 Rays = collections.namedtuple('Rays', ('origins', 'directions', 'viewdirs', 'radii', 'lossmult', 'near', 'far'))
@@ -790,3 +791,179 @@ def make_dot(var):
 
 def eikonal_loss(grad_theta):
     return (torch.square(grad_theta.norm(2, dim=1) - 1)).mean()
+
+
+def uniform_sample(ray_d, n_samples, near, far, randomized=False):
+    t_vals = torch.linspace(0., 1., n_samples).to(ray_d.device)
+    z_vals = near * (1. - t_vals) + far * t_vals
+
+    if randomized:
+        # get intervals between samples
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], -1)
+        lower = torch.cat([z_vals[..., :1], mids], -1)
+        # stratified samples in those intervals
+        t_rand = torch.rand(z_vals.shape).to(ray_d.device)
+
+        z_vals = lower + (upper - lower) * t_rand
+    return z_vals
+
+
+def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, eps=1e-3):
+    z_vals = uniform_sample(ray_d, n_samples, near, far)
+    samples, samples_idx = z_vals, None
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    bound = (1.0 / (4.0 * torch.log(torch.tensor(eps + 1.0)))) * (dists ** 2.).sum(-1)
+    beta = torch.sqrt(bound)
+
+    total_iters, not_converge = 0, True
+
+    while not_converge and total_iters < 10:
+        pts = ray_o[..., None, :] + ray_d[..., None, :] * samples[..., None]
+        pts = pts.reshape(-1, 3)
+        with torch.no_grad():
+            samples_sdf = sdf_network(pts)[1]
+            if samples_idx is not None:
+                sdf_merge = torch.cat([sdf.reshape(1, -1, z_vals.shape[2] - samples.shape[2]),
+                                       samples_sdf.reshape(1, -1, samples.shape[2])], -1)
+                sdf = torch.gather(sdf_merge, 2, samples_idx).reshape(-1, 1)
+            else:
+                sdf = samples_sdf
+
+        d = sdf.reshape(z_vals.shape)
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        a, b, c = dists, d[..., :-1].abs(), d[..., 1:].abs()
+        first_cond = a.pow(2) + b.pow(2) <= c.pow(2)
+        second_cond = a.pow(2) + c.pow(2) <= b.pow(2)
+        d_star = torch.zeros(z_vals.shape[0], z_vals.shape[1], z_vals.shape[2] - 1).cuda()
+        d_star[first_cond] = b[first_cond]
+        d_star[second_cond] = c[second_cond]
+        s = (a + b + c) / 2.0
+        area_before_sqrt = s * (s - a) * (s - b) * (s - c)
+        mask = ~first_cond & ~second_cond & (b + c - a > 0)
+        d_star[mask] = (2.0 * torch.sqrt(area_before_sqrt[mask])) / (a[mask])
+        d_star = (d[..., 1:].sign() * d[..., :-1].sign() == 1) * d_star  # Fixing the sign
+
+        # Updating beta using line search
+        curr_error = get_error_bound(beta0, sdf, z_vals, dists, d_star)
+        beta[curr_error <= eps] = beta0
+        beta_min, beta_max = torch.ones_like(beta) * beta0, beta
+        for _ in range(5):
+            beta_mid = (beta_min + beta_max) / 2.
+            curr_error = get_error_bound(beta_mid.unsqueeze(-1), sdf, z_vals, dists, d_star)
+            beta_max[curr_error <= eps] = beta_mid[curr_error <= eps]
+            beta_min[curr_error > eps] = beta_mid[curr_error > eps]
+        beta = beta_max
+
+        # Upsample more points
+        density = laplace_cdf(sdf.reshape(z_vals.shape), beta.unsqueeze(-1))
+
+        dists = torch.cat([dists, torch.tensor([1e10]).cuda().unsqueeze(0).repeat(*dists.shape[:-1], 1)], -1)
+        free_energy = dists * density
+        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).cuda(), free_energy[..., :-1]], dim=-1)
+        alpha = 1 - torch.exp(-free_energy)
+        transmittance = torch.exp(-torch.cumsum(shifted_free_energy, dim=-1))
+        weights = alpha * transmittance  # probability of the ray hits something here
+
+        #  Check if we are done and this is the last sampling
+        total_iters += 1
+        not_converge = beta.max() > beta0
+
+        if not_converge and total_iters < 10:
+            ''' Sample more points proportional to the current error bound'''
+
+            N = 10
+
+            bins = z_vals
+            error_per_section = torch.exp(-d_star / beta.unsqueeze(-1)) * (dists[..., :-1] ** 2.) / (
+                        4 * beta.unsqueeze(-1) ** 2)
+            error_integral = torch.cumsum(error_per_section, dim=-1)
+            bound_opacity = (torch.clamp(torch.exp(error_integral), max=1.e6) - 1.0) * transmittance[..., :-1]
+
+            pdf = bound_opacity + 0.0
+            pdf = pdf / torch.sum(pdf, -1, keepdim=True)
+            cdf = torch.cumsum(pdf, -1)
+            cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
+
+        else:
+            ''' Sample the final sample set to be used in the volume rendering integral '''
+
+            N = n_samples
+
+            bins = z_vals
+            pdf = weights[..., :-1]
+            pdf = pdf + 1e-5  # prevent nans
+            pdf = pdf / torch.sum(pdf, -1, keepdim=True)
+            cdf = torch.cumsum(pdf, -1)
+            cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (batch, len(bins))
+
+        # Invert CDF
+        if not_converge and total_iters < 10:
+            u = torch.linspace(0., 1., steps=N).cuda().unsqueeze(0).repeat(*cdf.shape[:-1], 1)
+        else:
+            u = torch.rand(list(cdf.shape[:-1]) + [N]).cuda()
+        u = u.contiguous()
+
+        inds = torch.searchsorted(cdf, u, right=True)
+        below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+        above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
+        inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+
+        matched_shape = [inds_g.shape[0], inds_g.shape[1], inds_g.shape[2], cdf.shape[-1]]
+        cdf_g = torch.gather(cdf.unsqueeze(2).expand(matched_shape), 3, inds_g)
+        bins_g = torch.gather(bins.unsqueeze(2).expand(matched_shape), 3, inds_g)
+
+        denom = (cdf_g[..., 1] - cdf_g[..., 0])
+        denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+        t = (u - cdf_g[..., 0]) / denom
+        samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+
+        # Adding samples if we not converged
+        if not_converge and total_iters < 10:
+            z_vals, samples_idx = torch.sort(torch.cat([z_vals, samples], -1), -1)
+
+    z_vals, _ = torch.sort(samples, -1)
+
+    # add some of the near surface points
+    '''idx = torch.randint(z_vals.shape[-1], (z_vals.shape[0],)).cuda()
+    z_samples_eik = torch.gather(z_vals, 1, idx.unsqueeze(-1))'''
+
+    return z_vals, pdf
+
+def get_error_bound(beta, sdf, z_vals, dists, d_star):
+    density = laplace_cdf(sdf.reshape(z_vals.shape), beta=beta)
+    shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).cuda(), dists * density[..., :-1]], dim=-1)
+    integral_estimation = torch.cumsum(shifted_free_energy, dim=-1)
+    error_per_section = torch.exp(-d_star / beta) * (dists ** 2.) / (4 * beta ** 2)
+    error_integral = torch.cumsum(error_per_section, dim=-1)
+    bound_opacity = (torch.clamp(torch.exp(error_integral), max=1.e6) - 1.0) * torch.exp(
+        -integral_estimation[..., :-1])
+
+    return bound_opacity.max(-1)[0]
+
+
+def laplace_cdf(x, beta):
+    return (.5 + .5 * x.sign() * torch.expm1(-x.abs() / beta)) / beta
+
+
+def positional_encoding(v: Tensor,
+        sigma: float,
+        m: int) -> Tensor:
+    r"""Computes :math:`\gamma(\mathbf{v}) = (\dots, \cos{2 \pi \sigma^{(j/m)} \mathbf{v}} , \sin{2 \pi \sigma^{(j/m)} \mathbf{v}}, \dots)`
+        where :math:`j \in \{0, \dots, m-1\}`
+
+    Args:
+        v (Tensor): input tensor of shape :math:`(N, *, \text{input_size})`
+        sigma (float): constant chosen based upon the domain of :attr:`v`
+        m (int): [description]
+
+    Returns:
+        Tensor: mapped tensor of shape :math:`(N, *, 2 \cdot m \cdot \text{input_size})`
+
+    See :class:`~rff.layers.PositionalEncoding` for more details.
+    """
+    j = torch.arange(m, device=v.device)
+    coeffs = 2 * np.pi * sigma ** (j / m)
+    vp = coeffs * torch.unsqueeze(v, -1)
+    vp_cat = torch.cat((torch.cos(vp), torch.sin(vp)), dim=-1)
+    return vp_cat.flatten(-2, -1)

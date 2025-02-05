@@ -541,17 +541,47 @@ class SDRPulseDataset(Dataset):
         self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float)
         self.pans = torch.tensor(rp.pan(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
         self.tilts = torch.tensor(rp.tilt(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
+        self.az_bw = np.float32(rp.az_half_bw)
+        self.el_bw = np.float32(rp.el_half_bw)
+        self.ray_samples = 1024
 
         # Concatenate data for easier use
         self.data = torch.cat([self.pos, self.pans.unsqueeze(-1), self.tilts.unsqueeze(-1)], dim=-1)
+        tran_gain_db = 25.
+        rec_gain_db = 25.
+        amp_gain_db = 30.
+        tran_power_watt = 100.
+        self.radar_coeff = np.float32(
+            c0 ** 2 / sdr_f[0].fc ** 2 * tran_power_watt * 10 ** (
+                    (tran_gain_db + 2.15) / 10) * 10 ** (
+                    (rec_gain_db + 2.15) / 10) *
+            10 ** ((amp_gain_db + 2.15) / 10) / (4 * np.pi) ** 3)
+
+        self.az_vals = torch.distributions.Uniform(-self.az_bw * 3, self.az_bw * 3)
+        self.el_vals = torch.distributions.Uniform(-self.el_bw, self.el_bw * 2)
         # self.data.requires_grad_(True)
 
 
     def __getitem__(self, p_idx):
-        return self.data[p_idx], self.pulses[p_idx]
+        ray_d, ray_o, ray_p = self.generate_rays(self.data[p_idx])
+        return ray_d, ray_o, ray_p, self.pulses[p_idx]
 
     def __len__(self):
         return self.data.shape[0]
+
+    def generate_rays(self, ray_info):
+        # Generate random rays for sampling
+        az_vals = self.az_vals.rsample((self.ray_samples, 1))
+        el_vals = self.el_vals.rsample((self.ray_samples, 1))
+        ray_p = torch.square(torch.sinc(az_vals / self.az_bw)) * torch.square(
+            torch.sinc(el_vals / self.el_bw)) * self.radar_coeff
+        az_vals = az_vals + ray_info[..., 3]
+        el_vals = el_vals + ray_info[..., 4]
+        ray_d = torch.cat(
+            [torch.sin(az_vals) * torch.cos(el_vals), torch.cos(az_vals) * torch.cos(el_vals), -torch.sin(el_vals)],
+            dim=-1)
+        ray_o = torch.broadcast_to(ray_info[..., :3], ray_d.shape)
+        return ray_d, ray_o, ray_p
 
 
 class SARNeRFModule(LightningDataModule):
