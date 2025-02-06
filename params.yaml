@@ -69,7 +69,7 @@ sarnerf_params:
     pulse_std: 741815608.4201782
   # model hyperparams
   model:
-    num_samples: 128
+    num_samples: 64
     fine_samples: 64
     hidden: 512
     density_noise: 0.0

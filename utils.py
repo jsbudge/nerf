@@ -809,40 +809,43 @@ def uniform_sample(ray_d, n_samples, near, far, randomized=False):
     return z_vals
 
 
-def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, eps=1e-3):
+def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, eps=1e-3):
+    beta0 = _beta.detach()
+    max_iters = 10
     z_vals = uniform_sample(ray_d, n_samples, near, far)
     samples, samples_idx = z_vals, None
     dists = z_vals[..., 1:] - z_vals[..., :-1]
-    bound = (1.0 / (4.0 * torch.log(torch.tensor(eps + 1.0)))) * (dists ** 2.).sum(-1)
+    bound = (1.0 / (4.0 * torch.log(torch.tensor(eps + 1.0)))) * torch.sum(torch.square(dists), dim=-1)
     beta = torch.sqrt(bound)
 
     total_iters, not_converge = 0, True
 
-    while not_converge and total_iters < 10:
+    while not_converge and total_iters < max_iters:
         pts = ray_o[..., None, :] + ray_d[..., None, :] * samples[..., None]
         pts = pts.reshape(-1, 3)
         with torch.no_grad():
-            samples_sdf = sdf_network(pts)[1]
+            samples_sdf = sdf_network(pts)
             if samples_idx is not None:
-                sdf_merge = torch.cat([sdf.reshape(1, -1, z_vals.shape[2] - samples.shape[2]),
-                                       samples_sdf.reshape(1, -1, samples.shape[2])], -1)
+                sdf = sdf.reshape(1, -1, z_vals.shape[2] - samples.shape[2])
+                samples_sdf = samples_sdf.reshape(1, -1, samples.shape[2])
+                sdf_merge = torch.cat([sdf, samples_sdf], -1)
                 sdf = torch.gather(sdf_merge, 2, samples_idx).reshape(-1, 1)
             else:
                 sdf = samples_sdf
 
         d = sdf.reshape(z_vals.shape)
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        a, b, c = dists, d[..., :-1].abs(), d[..., 1:].abs()
-        first_cond = a.pow(2) + b.pow(2) <= c.pow(2)
-        second_cond = a.pow(2) + c.pow(2) <= b.pow(2)
-        d_star = torch.zeros(z_vals.shape[0], z_vals.shape[1], z_vals.shape[2] - 1).cuda()
+        a, b, c = dists, torch.abs(d[..., :-1]), torch.abs(d[..., 1:])
+        first_cond = torch.square(a) + torch.square(b) <= torch.square(c)
+        second_cond = torch.square(a) + torch.square(c) <= torch.square(b)
+        d_star = torch.zeros(z_vals.shape[0], z_vals.shape[1], z_vals.shape[2] - 1).to(z_vals.device)
         d_star[first_cond] = b[first_cond]
         d_star[second_cond] = c[second_cond]
         s = (a + b + c) / 2.0
         area_before_sqrt = s * (s - a) * (s - b) * (s - c)
         mask = ~first_cond & ~second_cond & (b + c - a > 0)
         d_star[mask] = (2.0 * torch.sqrt(area_before_sqrt[mask])) / (a[mask])
-        d_star = (d[..., 1:].sign() * d[..., :-1].sign() == 1) * d_star  # Fixing the sign
+        d_star = (torch.sign(d[..., 1:]) * torch.sign(d[..., :-1]) == 1) * d_star  # Fixing the sign
 
         # Updating beta using line search
         curr_error = get_error_bound(beta0, sdf, z_vals, dists, d_star)
@@ -851,16 +854,16 @@ def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, e
         for _ in range(5):
             beta_mid = (beta_min + beta_max) / 2.
             curr_error = get_error_bound(beta_mid.unsqueeze(-1), sdf, z_vals, dists, d_star)
+            # err_bound = curr_error <= eps
             beta_max[curr_error <= eps] = beta_mid[curr_error <= eps]
             beta_min[curr_error > eps] = beta_mid[curr_error > eps]
-        beta = beta_max
+        beta = beta_max.unsqueeze(-1)
 
-        # Upsample more points
-        density = laplace_cdf(sdf.reshape(z_vals.shape), beta.unsqueeze(-1))
+        density = laplace_cdf(sdf.reshape(z_vals.shape), beta)
 
-        dists = torch.cat([dists, torch.tensor([1e10]).cuda().unsqueeze(0).repeat(*dists.shape[:-1], 1)], -1)
+        dists = torch.cat([dists, torch.ones(*dists.shape[:-1], 1).to(dists.device) * 1e10], -1)
         free_energy = dists * density
-        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).cuda(), free_energy[..., :-1]], dim=-1)
+        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]], dim=-1)
         alpha = 1 - torch.exp(-free_energy)
         transmittance = torch.exp(-torch.cumsum(shifted_free_energy, dim=-1))
         weights = alpha * transmittance  # probability of the ray hits something here
@@ -869,39 +872,34 @@ def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, e
         total_iters += 1
         not_converge = beta.max() > beta0
 
-        if not_converge and total_iters < 10:
+        if not_converge and total_iters < max_iters:
             ''' Sample more points proportional to the current error bound'''
 
             N = 10
 
-            bins = z_vals
-            error_per_section = torch.exp(-d_star / beta.unsqueeze(-1)) * (dists[..., :-1] ** 2.) / (
-                        4 * beta.unsqueeze(-1) ** 2)
+            error_per_section = torch.exp(-d_star / beta) * torch.square(dists[..., :-1]) / (
+                        4 * torch.square(beta))
             error_integral = torch.cumsum(error_per_section, dim=-1)
             bound_opacity = (torch.clamp(torch.exp(error_integral), max=1.e6) - 1.0) * transmittance[..., :-1]
 
             pdf = bound_opacity + 0.0
-            pdf = pdf / torch.sum(pdf, -1, keepdim=True)
-            cdf = torch.cumsum(pdf, -1)
-            cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
-
         else:
             ''' Sample the final sample set to be used in the volume rendering integral '''
 
             N = n_samples
 
-            bins = z_vals
             pdf = weights[..., :-1]
             pdf = pdf + 1e-5  # prevent nans
-            pdf = pdf / torch.sum(pdf, -1, keepdim=True)
-            cdf = torch.cumsum(pdf, -1)
-            cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (batch, len(bins))
+        pdf = pdf / torch.sum(pdf, -1, keepdim=True)
+        cdf = torch.cumsum(pdf, -1)
+        cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
 
         # Invert CDF
-        if not_converge and total_iters < 10:
-            u = torch.linspace(0., 1., steps=N).cuda().unsqueeze(0).repeat(*cdf.shape[:-1], 1)
+        if not_converge and total_iters < max_iters:
+            u = torch.linspace(0., 1., steps=N).to(cdf.device)
+            u = torch.broadcast_to(u, (*cdf.shape[:-1], N))
         else:
-            u = torch.rand(list(cdf.shape[:-1]) + [N]).cuda()
+            u = torch.rand(*cdf.shape[:-1], N).to(cdf.device)
         u = u.contiguous()
 
         inds = torch.searchsorted(cdf, u, right=True)
@@ -911,7 +909,7 @@ def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, e
 
         matched_shape = [inds_g.shape[0], inds_g.shape[1], inds_g.shape[2], cdf.shape[-1]]
         cdf_g = torch.gather(cdf.unsqueeze(2).expand(matched_shape), 3, inds_g)
-        bins_g = torch.gather(bins.unsqueeze(2).expand(matched_shape), 3, inds_g)
+        bins_g = torch.gather(z_vals.unsqueeze(2).expand(matched_shape), 3, inds_g)
 
         denom = (cdf_g[..., 1] - cdf_g[..., 0])
         denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
@@ -919,8 +917,9 @@ def error_bound_sample(ray_d, ray_o, beta0, n_samples, near, far, sdf_network, e
         samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
         # Adding samples if we not converged
-        if not_converge and total_iters < 10:
+        if not_converge and total_iters < max_iters:
             z_vals, samples_idx = torch.sort(torch.cat([z_vals, samples], -1), -1)
+            beta = beta.squeeze(-1)
 
     z_vals, _ = torch.sort(samples, -1)
 
@@ -934,7 +933,7 @@ def get_error_bound(beta, sdf, z_vals, dists, d_star):
     density = laplace_cdf(sdf.reshape(z_vals.shape), beta=beta)
     shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).cuda(), dists * density[..., :-1]], dim=-1)
     integral_estimation = torch.cumsum(shifted_free_energy, dim=-1)
-    error_per_section = torch.exp(-d_star / beta) * (dists ** 2.) / (4 * beta ** 2)
+    error_per_section = torch.exp(-d_star / beta) * torch.square(dists) / (4 * torch.square(beta))
     error_integral = torch.cumsum(error_per_section, dim=-1)
     bound_opacity = (torch.clamp(torch.exp(error_integral), max=1.e6) - 1.0) * torch.exp(
         -integral_estimation[..., :-1])
@@ -943,7 +942,7 @@ def get_error_bound(beta, sdf, z_vals, dists, d_star):
 
 
 def laplace_cdf(x, beta):
-    return (.5 + .5 * x.sign() * torch.expm1(-x.abs() / beta)) / beta
+    return (.5 + .5 * torch.sign(x) * torch.expm1(-torch.abs(x) / beta)) / beta
 
 
 def positional_encoding(v: Tensor,

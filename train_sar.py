@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 import open3d as o3d
 import matplotlib as mplib
 
+from utils import laplace_cdf
+
 pio.renderers.default = 'browser'
 
 
@@ -109,13 +111,13 @@ if __name__ == '__main__':
     pts = torch.cat([model.eik_base, torch.rand(size=(model.eik_base.shape[0], 3)) * np.diff(model.scene_bbox, axis=0) + model.scene_bbox[0]], dim=0).to(model.device)
 
     sdf_test, norm_test = model.sample_density_function(pts=pts)
-    density_test = model.laplace_cdf(sdf_test).cpu().data.numpy().flatten()
+    density_test = laplace_cdf(sdf_test, model.get_beta()).cpu().data.numpy().flatten()
     norm_test = norm_test.cpu().data.numpy().reshape(-1, 3)
     sdf_test = sdf_test.cpu().data.numpy().flatten()
 
     pts_np = pts.cpu().data.numpy()
     ax = plt.figure('Normals').add_subplot(projection='3d')
-    ax.quiver(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], norm_test[:, 0] * density_test * 50., norm_test[:, 1] * density_test * 50., norm_test[:, 2] * density_test * 50.)
+    ax.quiver(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], norm_test[:, 0], norm_test[:, 1], norm_test[:, 2])
     plt.show()
 
     ax = plt.figure('Density').add_subplot(projection='3d')
@@ -124,11 +126,11 @@ if __name__ == '__main__':
 
     # Build out the pulse
     ray_d, ray_o, ray_p, target = next(iter(data.train_dataloader()))
-    pulse, dist_tensor, sdf_tensor, acc_tensor, weight_tensor = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device))
+    pulse, dist_tensor, sdf_tensor, weight_tensor = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device))
     np_pulse = torch.view_as_complex(pulse).cpu().data.numpy()[0]
     np_target = torch.view_as_complex(target).cpu().data.numpy()[0]
     distances = dist_tensor[0].cpu().data.numpy()
-    densities = model.laplace_cdf(sdf_tensor)
+    densities = laplace_cdf(sdf_tensor, model.get_beta())
 
     nsam, nr, ranges, ranges_sampled, near_range_s, granges, fft_len, up_fft_len = (
             rp.getRadarParams(5., .75, 1))
@@ -191,7 +193,7 @@ if __name__ == '__main__':
     fig.show()
 
     sdf_cubes, _ = model.sample_density_function([gx.min(), gx.max()], [gy.min(), gy.max()], [gz.min(), gz.max()], [50, 50, 50])
-    vertices, triangles = mcubes.marching_cubes(sdf_cubes.cpu().data.numpy(), sdf_cubes.mean())
+    vertices, triangles = mcubes.marching_cubes(sdf_cubes.cpu().data.numpy(), 0)
 
     fig = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2])])
     fig.show()
