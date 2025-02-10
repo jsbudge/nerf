@@ -809,9 +809,8 @@ def uniform_sample(ray_d, n_samples, near, far, randomized=False):
     return z_vals
 
 
-def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, eps=1e-3):
+def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, eps=1e-3, max_iters=10, beta_iters=5, add_samples=32):
     beta0 = _beta.detach()
-    max_iters = 10
     z_vals = uniform_sample(ray_d, n_samples, near, far)
     samples, samples_idx = z_vals, None
     dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -851,7 +850,7 @@ def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, e
         curr_error = get_error_bound(beta0, sdf, z_vals, dists, d_star)
         beta[curr_error <= eps] = beta0
         beta_min, beta_max = torch.ones_like(beta) * beta0, beta
-        for _ in range(5):
+        for _ in range(beta_iters):
             beta_mid = (beta_min + beta_max) / 2.
             curr_error = get_error_bound(beta_mid.unsqueeze(-1), sdf, z_vals, dists, d_star)
             # err_bound = curr_error <= eps
@@ -875,51 +874,24 @@ def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, e
         if not_converge and total_iters < max_iters:
             ''' Sample more points proportional to the current error bound'''
 
-            N = 10
-
             error_per_section = torch.exp(-d_star / beta) * torch.square(dists[..., :-1]) / (
                         4 * torch.square(beta))
             error_integral = torch.cumsum(error_per_section, dim=-1)
             bound_opacity = (torch.clamp(torch.exp(error_integral), max=1.e6) - 1.0) * transmittance[..., :-1]
 
             pdf = bound_opacity + 0.0
+            u = torch.linspace(0., 1., steps=add_samples).to(pdf.device)
+            u = torch.broadcast_to(u, (*pdf.shape[:-1], add_samples))
+            samples = sample_from_pdf(u, pdf, z_vals)
+            z_vals, samples_idx = torch.sort(torch.cat([z_vals, samples], -1), -1)
+            beta = beta.squeeze(-1)
         else:
             ''' Sample the final sample set to be used in the volume rendering integral '''
 
-            N = n_samples
-
             pdf = weights[..., :-1]
             pdf = pdf + 1e-5  # prevent nans
-        pdf = pdf / torch.sum(pdf, -1, keepdim=True)
-        cdf = torch.cumsum(pdf, -1)
-        cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
-
-        # Invert CDF
-        if not_converge and total_iters < max_iters:
-            u = torch.linspace(0., 1., steps=N).to(cdf.device)
-            u = torch.broadcast_to(u, (*cdf.shape[:-1], N))
-        else:
-            u = torch.rand(*cdf.shape[:-1], N).to(cdf.device)
-        u = u.contiguous()
-
-        inds = torch.searchsorted(cdf, u, right=True)
-        below = torch.max(torch.zeros_like(inds - 1), inds - 1)
-        above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
-        inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
-
-        matched_shape = [inds_g.shape[0], inds_g.shape[1], inds_g.shape[2], cdf.shape[-1]]
-        cdf_g = torch.gather(cdf.unsqueeze(2).expand(matched_shape), 3, inds_g)
-        bins_g = torch.gather(z_vals.unsqueeze(2).expand(matched_shape), 3, inds_g)
-
-        denom = (cdf_g[..., 1] - cdf_g[..., 0])
-        denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
-        t = (u - cdf_g[..., 0]) / denom
-        samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
-
-        # Adding samples if we not converged
-        if not_converge and total_iters < max_iters:
-            z_vals, samples_idx = torch.sort(torch.cat([z_vals, samples], -1), -1)
-            beta = beta.squeeze(-1)
+            u = torch.rand(*pdf.shape[:-1], n_samples).to(pdf.device)
+            samples = sample_from_pdf(u, pdf, z_vals)
 
     z_vals, _ = torch.sort(samples, -1)
 
@@ -928,6 +900,27 @@ def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, e
     z_samples_eik = torch.gather(z_vals, 1, idx.unsqueeze(-1))'''
 
     return z_vals, pdf
+
+
+def sample_from_pdf(u, pdf, z_vals):
+    pdf = pdf / torch.sum(pdf, -1, keepdim=True)
+    cdf = torch.cumsum(pdf, -1)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
+    u = u.contiguous()
+
+    inds = torch.searchsorted(cdf, u, right=True)
+    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
+    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], inds_g.shape[2], cdf.shape[-1]]
+    cdf_g = torch.gather(cdf.unsqueeze(2).expand(matched_shape), 3, inds_g)
+    bins_g = torch.gather(z_vals.unsqueeze(2).expand(matched_shape), 3, inds_g)
+
+    denom = (cdf_g[..., 1] - cdf_g[..., 0])
+    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t = (u - cdf_g[..., 0]) / denom
+    return bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
 def get_error_bound(beta, sdf, z_vals, dists, d_star):
     density = laplace_cdf(sdf.reshape(z_vals.shape), beta=beta)

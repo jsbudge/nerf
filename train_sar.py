@@ -192,6 +192,7 @@ if __name__ == '__main__':
             fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))'''
     fig.show()
 
+    model.to('cpu')
     sdf_cubes, _ = model.sample_density_function([gx.min(), gx.max()], [gy.min(), gy.max()], [gz.min(), gz.max()], [50, 50, 50])
     vertices, triangles = mcubes.marching_cubes(sdf_cubes.cpu().data.numpy(), 0)
 
