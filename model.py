@@ -9,7 +9,7 @@ from simulib.platform_helper import SDRPlatform
 from torch import optim, Tensor
 from torch.optim import Optimizer
 from utils import sample_along_rays, resample_along_rays, volumetric_rendering, namedtuple_map, to8b, \
-    plot_grad_flow, eikonal_loss, positional_encoding, laplace_cdf, error_bound_sample
+    plot_grad_flow, eikonal_loss, positional_encoding, laplace_cdf, error_bound_sample, uniform_sample
 from pytorch_lightning import LightningModule
 from util_modules import PositionalEncoding, MipLRDecay, NeRFLoss
 from torch.distributions import Uniform
@@ -271,7 +271,7 @@ class SARNeRF(LightningModule):
         self.mpp = np.float32(pulse_bins[1] - pulse_bins[0])
         self.far_range = np.float32(near_range_s * c0 + self.nsam * self.mpp)
         self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz), dtype=torch.complex64)
-        self.pulse_bins = torch.tensor(pulse_bins + self.near_range, dtype=torch.float32)
+        self.pulse_bins = torch.tensor(pulse_bins, dtype=torch.float32)
         self.az_bw = np.float32(rp.az_half_bw)
         self.el_bw = np.float32(rp.el_half_bw)
 
@@ -285,23 +285,23 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        self.use_eik_base = False
+        # self.use_eik_base = False
 
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
 
         self.param0 = nn.Sequential(
-            nn.Linear(config.hidden, config.hidden),
+            nn.Linear(config.hidden, config.param_hidden),
             nn.SiLU(),
-            nn.Linear(config.hidden, config.hidden),
+            nn.Linear(config.param_hidden, config.param_hidden),
             nn.SiLU(),
         )
 
         self.param1 = nn.Sequential(
-            nn.Linear(config.hidden + self.density_input, config.hidden),
+            nn.Linear(config.param_hidden + self.density_input, config.param_hidden),
             nn.SiLU(),
-            nn.Linear(config.hidden, config.hidden),
+            nn.Linear(config.param_hidden, config.param_hidden),
             nn.SiLU(),
-            nn.Linear(config.hidden, 2),
+            nn.Linear(config.param_hidden, 2),
             nn.Softplus(),
         )
 
@@ -317,17 +317,19 @@ class SARNeRF(LightningModule):
         # Calculate sphere intersections for near and far
         bb_enter, bb_leave, hits = self.bb_intersect(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3))
         pulse_bins = self.pulse_bins.to(self.device)
-        near = torch.clamp_min(bb_enter.view(ray_p.shape), self.near_range)
-        far = torch.clamp_max(bb_leave.view(ray_p.shape), self.far_range)
+        near = torch.clamp_(bb_enter.view(ray_p.shape), self.near_range, self.far_range - 1)
+        far = torch.clamp_(bb_leave.view(ray_p.shape), self.near_range, self.far_range)
 
-        hit_mask = hits.squeeze(-1)
+        '''hit_mask = hits.squeeze(-1)
         ray_d = ray_d[:, hit_mask]
         ray_o = ray_o[:, hit_mask]
         ray_p = ray_p[:, hit_mask]
         near = near[:, hit_mask]
-        far = far[:, hit_mask]
+        far = far[:, hit_mask]'''
 
-        z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
+        z_vals = uniform_sample(ray_d, self.num_samples, near, far)
+
+        # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
         pts = pts.reshape(-1, 3)
         pts.requires_grad_(True)
@@ -335,7 +337,7 @@ class SARNeRF(LightningModule):
         density = laplace_cdf(sdf.reshape(z_vals.shape), self.get_beta())
 
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.ones(*dists.shape[:-1], 1).to(dists.device) * 1e10], -1)
+        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
         free_energy = dists * density
         shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]],
                                         dim=-1)
@@ -365,11 +367,11 @@ class SARNeRF(LightningModule):
         '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
             torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1)'''
         ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1)
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1) * 16.
         # ref_model = ray_p.squeeze(-1) / torch.square(distance)
 
         # Get soft buckets to preserve gradients across histogramming step
-        bound_dist = torch.abs(distance.unsqueeze(-1) - pulse_bins.unsqueeze(0))
+        bound_dist = torch.abs(distance.unsqueeze(-1) / 2 - pulse_bins.unsqueeze(0))
         soft_buckets = torch.softmax(-bound_dist / self.temperature, dim=-1)
 
         # Calculate out expected phase as well
@@ -414,7 +416,7 @@ class SARNeRF(LightningModule):
 
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.config.lr_init, weight_decay=self.config.weight_decay)
+        optimizer = optim.AdamW(self.parameters(), lr=self.config.lr_init, weight_decay=self.config.weight_decay, foreach=False)
         scheduler = MipLRDecay(optimizer, lr_init=self.config.lr_init, lr_final=self.config.lr_final,
                                max_steps=self.config.max_steps, lr_delay_steps=self.config.lr_delay_steps,
                                lr_delay_mult=self.config.lr_delay_mult)
@@ -456,7 +458,7 @@ class SARNeRF(LightningModule):
         # Calculate out Eikonal loss
         if self.use_eik_base:
             eik_pts = (torch.rand(size=(self.eik_base.shape[0], 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]).to(self.device)
-            eik_loss = (torch.exp(-10. * torch.abs(self.sdf_network(eik_pts))).sum() + torch.abs(self.sdf_network(self.eik_base.to(self.device))).sum())
+            eik_loss = (torch.exp(-10. * torch.abs(self.sdf_network(eik_pts))).sum() + torch.abs(self.sdf_network(self.eik_base.to(self.device))).sum()) * np.exp(-self.global_step / 150)
             eik_pts = torch.cat([eik_pts, self.eik_base.to(self.device)], dim=0)
         else:
             eik_pts = (torch.rand(size=(ray_d.shape[1] * 2, 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]).to(
@@ -479,12 +481,12 @@ class SARNeRF(LightningModule):
         pdf_weights = weights + .00001
         pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.ones(*dists.shape[:-1], 1).to(dists.device) * 1e10], -1)
-        density_entropy = torch.nanmean(-torch.sum(torch.log2(pdf_weights[..., :-1]) * pdf_weights[..., :-1] * dists[..., :-1], dim=-1))
+        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
+        density_entropy = torch.nanmean(-torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1))
 
         density_std = self.sdf_network(eik_pts).std()
 
-        loss = loss + density_entropy# 1. / (1e-3 + density_std)
+        loss = loss + density_entropy + eik_loss
 
         loss_name = 'train_loss' if do_train else 'val_loss'
         self.log_dict({loss_name: loss, 'eik_loss': eik_loss, 'psnr': psnr, 'lr': self.lr_schedulers().get_last_lr()[0],
@@ -492,7 +494,7 @@ class SARNeRF(LightningModule):
                       prog_bar=True, rank_zero_only=True)
         if do_train:
             self.manual_backward(loss, retain_graph=True)
-            # self.clip_gradients(opt, gradient_clip_val=50, gradient_clip_algorithm='norm')
+            self.clip_gradients(opt, gradient_clip_val=50, gradient_clip_algorithm='norm')
             # plot_grad_flow(self.named_parameters())
             opt.step()
             self.lr_schedulers().step()
@@ -513,7 +515,7 @@ class SARNeRF(LightningModule):
             tnear = torch.max(t1, dim=-1)[0]
             tfar = torch.min(t2, dim=-1)[0]
             hits = torch.logical_and(tnear - tfar < 0, tfar >= 0)
-        return tnear, tfar, torch.logical_and(hits, tnear < self.far_range)
+        return tnear, tfar, hits# torch.logical_and(hits, tnear < self.far_range)
 
 
 
@@ -571,7 +573,7 @@ class Siren(nn.Module):
         is_first = False,
         use_bias = True,
         activation = None,
-        dropout = .1
+        dropout = .25
     ):
         super().__init__()
         self.dim_in = dim_in

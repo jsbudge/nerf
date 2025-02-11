@@ -860,7 +860,7 @@ def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, e
 
         density = laplace_cdf(sdf.reshape(z_vals.shape), beta)
 
-        dists = torch.cat([dists, torch.ones(*dists.shape[:-1], 1).to(dists.device) * 1e10], -1)
+        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
         free_energy = dists * density
         shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]], dim=-1)
         alpha = 1 - torch.exp(-free_energy)
@@ -924,7 +924,7 @@ def sample_from_pdf(u, pdf, z_vals):
 
 def get_error_bound(beta, sdf, z_vals, dists, d_star):
     density = laplace_cdf(sdf.reshape(z_vals.shape), beta=beta)
-    shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).cuda(), dists * density[..., :-1]], dim=-1)
+    shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), dists * density[..., :-1]], dim=-1)
     integral_estimation = torch.cumsum(shifted_free_energy, dim=-1)
     error_per_section = torch.exp(-d_star / beta) * torch.square(dists) / (4 * torch.square(beta))
     error_integral = torch.cumsum(error_per_section, dim=-1)

@@ -511,8 +511,8 @@ class NeRFModule(LightningDataModule):
 
 
 class SDRPulseDataset(Dataset):
-    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, distributed: bool = False,
-                 is_val: bool = False, seed: int = 42):
+    def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, ray_samples: int = 1024,
+                 box: np.array = None, distributed: bool = False, is_val: bool = False, seed: int = 42):
         if distributed:
             sdr_f = load(sdr_file, import_pickle=False, export_pickle=False)
         else:
@@ -543,13 +543,13 @@ class SDRPulseDataset(Dataset):
         self.tilts = torch.tensor(rp.tilt(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
         self.az_bw = np.float32(rp.az_half_bw)
         self.el_bw = np.float32(rp.el_half_bw)
-        self.ray_samples = 1024
+        self.ray_samples = ray_samples
 
         # Concatenate data for easier use
         self.data = torch.cat([self.pos, self.pans.unsqueeze(-1), self.tilts.unsqueeze(-1)], dim=-1)
         tran_gain_db = 25.
         rec_gain_db = 25.
-        amp_gain_db = 30.
+        amp_gain_db = 50.
         tran_power_watt = 100.
         self.radar_coeff = np.float32(
             c0 ** 2 / sdr_f[0].fc ** 2 * tran_power_watt * 10 ** (
@@ -558,7 +558,10 @@ class SDRPulseDataset(Dataset):
             10 ** ((amp_gain_db + 2.15) / 10) / (4 * np.pi) ** 3)
 
         self.az_vals = torch.distributions.Uniform(-self.az_bw * 3, self.az_bw * 3)
-        self.el_vals = torch.distributions.Uniform(-self.el_bw, self.el_bw * 2)
+        self.el_vals = torch.distributions.Beta(1, 3)
+        '''self.x_vals = torch.distributions.Uniform(box[0, 0] + 1, box[1, 0] - 1)
+        self.y_vals = torch.distributions.Uniform(box[0, 1] + 1, box[1, 1] - 1)
+        self.z_vals = torch.distributions.Uniform(box[0, 2] + 1, box[1, 2] - 1)'''
         # self.data.requires_grad_(True)
 
 
@@ -571,8 +574,17 @@ class SDRPulseDataset(Dataset):
 
     def generate_rays(self, ray_info):
         # Generate random rays for sampling
+        '''x_vals = self.x_vals.rsample((self.ray_samples, 1))
+        y_vals = self.y_vals.rsample((self.ray_samples, 1))
+        z_vals = self.z_vals.rsample((self.ray_samples, 1))
+        vecs = torch.cat([x_vals - ray_info[..., 0], y_vals - ray_info[..., 1], z_vals - ray_info[..., 2]], dim=-1)
+        vecs = vecs / torch.linalg.norm(vecs, dim=-1)[:, None]
+        az_vals = torch.arctan2(vecs[:, 0], vecs[:, 1]).view(-1, 1)
+        el_vals = -torch.arcsin(vecs[:, 2]).view(-1, 1)
+        ray_p = torch.square(torch.sinc((az_vals - ray_info[..., 3]) / self.az_bw)) * torch.square(
+            torch.sinc((el_vals - ray_info[..., 4]) / self.el_bw)) * self.radar_coeff'''
         az_vals = self.az_vals.rsample((self.ray_samples, 1))
-        el_vals = self.el_vals.rsample((self.ray_samples, 1))
+        el_vals = self.el_vals.rsample((self.ray_samples, 1)) * self.el_bw * 3 - self.el_bw / 2
         ray_p = torch.square(torch.sinc(az_vals / self.az_bw)) * torch.square(
             torch.sinc(el_vals / self.el_bw)) * self.radar_coeff
         az_vals = az_vals + ray_info[..., 3]
@@ -585,19 +597,23 @@ class SDRPulseDataset(Dataset):
 
 
 class SARNeRFModule(LightningDataModule):
-    def __init__(self, config, sphere_intersection: float = 1500.):
+    def __init__(self, config, bounding_box: np.array = None):
         super().__init__()
         self.config = config
         self.train_dataset = None
         self.val_dataset = None
-        self.sph_inter = sphere_intersection
+        self.bounding_box = bounding_box
 
     def setup(self, stage: Optional[str] = None) -> None:
         self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center, distributed = self.config.distributed, is_val=False, seed=42)
+                                             data_center = self.config.data_center,
+                                             ray_samples = self.config.ray_samples, box = self.bounding_box,
+                                             distributed = self.config.distributed, is_val=False, seed=42)
 
         self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center, distributed = self.config.distributed, is_val=True, seed=42)
+                                             data_center = self.config.data_center,
+                                           ray_samples = self.config.ray_samples, box = self.bounding_box,
+                                           distributed = self.config.distributed, is_val=True, seed=42)
 
 
     def train_dataloader(self) -> DataLoader:

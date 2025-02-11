@@ -10,6 +10,8 @@ import plotly.graph_objects as go
 from pytorch_lightning.strategies import FSDPStrategy
 from simulib.grid_helper import SDREnvironment
 from simulib.simulation_functions import azelToVec
+from tqdm import tqdm
+
 from config import get_config
 from dataloader import SARNeRFModule
 from model import SARNeRF
@@ -72,13 +74,13 @@ if __name__ == '__main__':
                              [gpts[:, 0].max() + 10, gpts[:, 1].max() + 10, gpts[:, 2].max() + 10]])
 
     print('Loading data...')
-    data = SARNeRFModule(config=config)
+    data = SARNeRFModule(config=config, bounding_box=bounding_box)
     data.setup()
     logger = loggers.TensorBoardLogger(config.log_dir, name="SARNeRF", version=0, log_graph=True)
 
     print('Building trainer...')
     if config.distributed:
-        trainer = Trainer(logger=logger, max_epochs=config.max_epochs, devices=2, detect_anomaly=False, overfit_batches=2,
+        trainer = Trainer(logger=logger, max_epochs=config.max_epochs, devices=2, detect_anomaly=False,
                           strategy=FSDPStrategy(sharding_strategy='SHARD_GRAD_OP'), num_sanity_val_steps=0,
                           check_val_every_n_epoch=100)
     else:
@@ -126,7 +128,9 @@ if __name__ == '__main__':
 
     # Build out the pulse
     ray_d, ray_o, ray_p, target = next(iter(data.train_dataloader()))
-    pulse, dist_tensor, sdf_tensor, weight_tensor = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device))
+    model.to('cpu')
+    pulse, dist_tensor, z_tensor, weight_tensor = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device))
+    sdf_tensor, _, density_tensor, _ = model(ray_d.to(model.device), ray_o.to(model.device), ray_p.to(model.device), return_occ=True)
     np_pulse = torch.view_as_complex(pulse).cpu().data.numpy()[0]
     np_target = torch.view_as_complex(target).cpu().data.numpy()[0]
     distances = dist_tensor[0].cpu().data.numpy()
@@ -192,9 +196,29 @@ if __name__ == '__main__':
             fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))'''
     fig.show()
 
-    model.to('cpu')
-    sdf_cubes, _ = model.sample_density_function([gx.min(), gx.max()], [gy.min(), gy.max()], [gz.min(), gz.max()], [50, 50, 50])
-    vertices, triangles = mcubes.marching_cubes(sdf_cubes.cpu().data.numpy(), 0)
+    ray_trace = (ray_o[0, 0].detach() + ray_d[0, 0].detach() * ranges[::nsam - 1][:, None]).cpu().data.numpy()
+    z_trace = (ray_o[0, 0].detach() + ray_d[0, 0].detach() * z_tensor[0, 0][:, None]).cpu().data.numpy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=ray_trace[:, 0], y=ray_trace[:, 1], z=ray_trace[:, 2], mode='lines'))
+    fig.add_trace(go.Scatter3d(x=gpts[:, 0], y=gpts[:, 1], z=gpts[:, 2], mode='markers', marker=dict(opacity=.5)))
+    fig.add_trace(go.Scatter3d(x=z_trace[:, 0], y=z_trace[:, 1], z=z_trace[:, 2],
+                               marker=dict(size=densities[0, 0, :, 0].cpu().data.numpy() * 10), mode='markers'))
+    fig.add_trace(bbox)
+    fig.update_layout(
+        scene=dict(xaxis=dict(range=[flight_path[:, 0].min(), flight_path[:, 0].max()]),
+                   yaxis=dict(range=[flight_path[:, 1].min(), flight_path[:, 1].max()]),
+                   zaxis=dict(range=[min(beampattern[:, 2].min(), gpts[:, 2].min(), ray_points[:, 2].min()) - 10,
+                                     flight_path[:, 2].max() + 100])),
+    )
+    fig.show()
+
+    model.to(device)
+    density_cubes = np.zeros((500, 500, 50))
+    for x in tqdm(range(0, 500, 50)):
+        for y in range(0, 500, 50):
+            sdf_cubes, _ = model.sample_density_function([gx.min(), gx.max()], [gy.min(), gy.max()], [gz.min(), gz.max()], [50, 50, 50])
+            density_cubes[x:x+50, y:y+50, :] = laplace_cdf(sdf_cubes, model.get_beta()).cpu().data.numpy()
+    vertices, triangles = mcubes.marching_cubes(density_cubes, 1.)
 
     fig = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2])])
     fig.show()

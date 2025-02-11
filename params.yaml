@@ -69,13 +69,14 @@ sarnerf_params:
     pulse_std: 741815608.4201782
   # model hyperparams
   model:
-    num_samples: 128
-    fine_samples: 128
-    hidden: 256
+    num_samples: 32
+    fine_samples: 32
+    hidden: 128
+    param_hidden: 32
     density_noise: 0.0
     density_bias: 0.0
     encoder_sigma: 10.
-    encoder_size: 16
+    encoder_size: 8
     wavelength: 0.031228381041666666
     az_bw: 0.039269908169872414
     el_bw: 0.09599310885968812
@@ -86,7 +87,7 @@ sarnerf_params:
     lr_final: .00005
     lr_delay_steps: 10000
     lr_delay_mult: 0.1
-    weight_decay: 0.0
+    weight_decay: 0.00001
     eikonal_weight: .1
     acc_weight: 1.
   # training hyperparams
@@ -96,7 +97,7 @@ sarnerf_params:
     max_steps: -1
     batch_size: 1
     device: cuda
-    ray_samples: 1024
+    ray_samples: 8192
     num_workers: 0
     single_example: False
     distributed: False
