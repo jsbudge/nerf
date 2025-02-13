@@ -5,6 +5,7 @@ import torch.nn as nn
 from matplotlib import pyplot as plt
 import matplotlib as mplib
 from pytorch_lightning.utilities import grad_norm
+from pytorch_lightning.utilities.types import STEP_OUTPUT
 from simulib.platform_helper import SDRPlatform
 from torch import optim, Tensor
 from torch.optim import Optimizer
@@ -232,7 +233,6 @@ def _xavier_init(model):
                 if fan_in != 0:
                     bound = 1 / math.sqrt(fan_in)
                     nn.init.uniform_(module.bias, -bound, bound)
-            # nn.init.he_(module.weight)
 
 
 class SARNeRF(LightningModule):
@@ -254,9 +254,9 @@ class SARNeRF(LightningModule):
         self.hidden = config.hidden
         self.wavelength = config.wavelength
         self.return_raw = return_raw
-        self.automatic_optimization = False
+        # self.automatic_optimization = False
         self.scene_bbox = scene_bbox.astype(np.float32)
-        self.temperature = .1
+        self.temperature = 1.
         self.pulse_std = config.pulse_std
         self.eikonal_weight = config.eikonal_weight
         self.acc_weight = config.acc_weight
@@ -265,13 +265,12 @@ class SARNeRF(LightningModule):
 
         sdr_f = load(config.sdr_file)
         rp = SDRPlatform(sdr_f, origin=config.data_center, channel=0, fs=sdr_f[0].fs)
-        self.nsam, _, pulse_bins, _, near_range_s, _, fft_sz, _ = rp.getRadarParams(5., .75, 1)
+        self.nsam, _, pulse_bins, _, near_range_s, _, fft_sz, _ = rp.getRadarParams(0., 0., 1)
         self.near_range = np.float32(near_range_s * c0)
-        self.near_range_s = np.float32(near_range_s)
-        self.mpp = np.float32(pulse_bins[1] - pulse_bins[0])
-        self.far_range = np.float32(near_range_s * c0 + self.nsam * self.mpp)
+        self.mpp = np.float32(c0 / rp.fs / 2)
+        self.far_range = np.float32(self.near_range + self.nsam * self.mpp)
         self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz), dtype=torch.complex64)
-        self.pulse_bins = torch.tensor(pulse_bins, dtype=torch.float32)
+        self.pulse_bins = torch.tensor(self.near_range + self.mpp * np.arange(self.nsam), dtype=torch.float32)
         self.az_bw = np.float32(rp.az_half_bw)
         self.el_bw = np.float32(rp.el_half_bw)
 
@@ -285,7 +284,7 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        # self.use_eik_base = False
+        self.use_eik_base = False
 
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
 
@@ -317,19 +316,21 @@ class SARNeRF(LightningModule):
         # Calculate sphere intersections for near and far
         bb_enter, bb_leave, hits = self.bb_intersect(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3))
         pulse_bins = self.pulse_bins.to(self.device)
-        near = torch.clamp_(bb_enter.view(ray_p.shape), self.near_range, self.far_range - 1)
-        far = torch.clamp_(bb_leave.view(ray_p.shape), self.near_range, self.far_range)
+        near = bb_enter.view(ray_p.shape)
+        far = bb_leave.view(ray_p.shape)
+        # near = torch.clamp_(bb_enter.view(ray_p.shape), self.near_range, self.far_range - 1)
+        # far = torch.clamp_(bb_leave.view(ray_p.shape), self.near_range, self.far_range)
 
-        '''hit_mask = hits.squeeze(-1)
+        hit_mask = hits.squeeze(-1)
         ray_d = ray_d[:, hit_mask]
         ray_o = ray_o[:, hit_mask]
         ray_p = ray_p[:, hit_mask]
         near = near[:, hit_mask]
-        far = far[:, hit_mask]'''
+        far = far[:, hit_mask]
 
-        z_vals = uniform_sample(ray_d, self.num_samples, near, far)
+        # z_vals = uniform_sample(ray_d, self.num_samples, near, far)
 
-        # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
+        z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
         pts = pts.reshape(-1, 3)
         pts.requires_grad_(True)
@@ -367,15 +368,15 @@ class SARNeRF(LightningModule):
         '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
             torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1)'''
         ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1) * 16.
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1) / 16.
         # ref_model = ray_p.squeeze(-1) / torch.square(distance)
 
         # Get soft buckets to preserve gradients across histogramming step
-        bound_dist = torch.abs(distance.unsqueeze(-1) / 2 - pulse_bins.unsqueeze(0))
+        bound_dist = torch.abs(distance.unsqueeze(-1) - pulse_bins.unsqueeze(0))
         soft_buckets = torch.softmax(-bound_dist / self.temperature, dim=-1)
 
         # Calculate out expected phase as well
-        ret = torch.view_as_real(ref_model * torch.exp(-2j * torch.pi / self.wavelength * distance))
+        ret = torch.view_as_real(ref_model * torch.exp(-4j * torch.pi / self.wavelength * distance))
 
         # Soft histogram step, along with applying filtered chirp in frequency domain
         comp_pulse = ret[:, :, None, :] * soft_buckets[:, :, :, None]
@@ -425,7 +426,7 @@ class SARNeRF(LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.train_val_get(batch, True)
-        if self.global_step % 100 == 0:
+        if self.global_step % 100 == 0 and self.trainer.is_global_zero:
             mplib.use('Agg')
             pts = torch.cat([self.eik_base, torch.rand(size=(self.eik_base.shape[0], 3)) *
                              np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]], dim=0).to(self.device)
@@ -442,62 +443,96 @@ class SARNeRF(LightningModule):
             ax.set_zlim(self.scene_bbox[0, 2], self.scene_bbox[1, 2])
             self.logger.experiment.add_figure('Density Plot', fig, global_step=self.global_step)
             plt.close(fig)
+        if self.automatic_optimization:
+            return self.loss
+
+    def on_train_batch_end(self, outputs: STEP_OUTPUT, batch: Any, batch_idx: int) -> None:
+        if not self.automatic_optimization:
+            opt = self.optimizers()
+            opt.zero_grad()
+            self.manual_backward(self.loss, retain_graph=True)
+            self.loss = None
+            opt.step()
+        self.lr_schedulers().step()
+
 
     def validation_step(self, batch, batch_idx):
         self.train_val_get(batch, False)
 
     def train_val_get(self, batch, do_train = True):
-        if do_train:
-            opt = self.optimizers()
-            opt.zero_grad()
         ray_d, ray_o, ray_p, target_data = batch
-
-        # Generate rays for random sampling
-        pulses, dists, z_vals, weights = self.forward(ray_d, ray_o, ray_p)
+        # chunk_sz = 1024
 
         # Calculate out Eikonal loss
         if self.use_eik_base:
-            eik_pts = (torch.rand(size=(self.eik_base.shape[0], 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]).to(self.device)
-            eik_loss = (torch.exp(-10. * torch.abs(self.sdf_network(eik_pts))).sum() + torch.abs(self.sdf_network(self.eik_base.to(self.device))).sum()) * np.exp(-self.global_step / 150)
+            eik_pts = (torch.rand(size=(self.eik_base.shape[0], 3)) * np.diff(self.scene_bbox, axis=0) +
+                       self.scene_bbox[0]).to(self.device)
+            eik_loss = (torch.exp(-10. * torch.abs(self.sdf_network(eik_pts))).sum() + torch.abs(
+                self.sdf_network(self.eik_base.to(self.device))).sum())
             eik_pts = torch.cat([eik_pts, self.eik_base.to(self.device)], dim=0)
         else:
-            eik_pts = (torch.rand(size=(ray_d.shape[1] * 2, 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]).to(
+            eik_pts = (torch.rand(size=(ray_d.shape[1] * 2, 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[
+                0]).to(
                 self.device)
             eik_loss = 0.
         eik_pts.requires_grad_(True)
         grad_theta = diff_ops.gradient(self.sdf_network(eik_pts), eik_pts)
         eik_loss = eikonal_loss(grad_theta) + eik_loss
 
-
-        # Compute cosine similarity between pulses
-        # loss = torch.nan_to_num(torch.sum(target_data * pulses, dim=-2) / (torch.linalg.norm(target_data, dim=-2) * torch.linalg.norm(pulses, dim=-2)), 1e9)
-        # loss = 1 - torch.mean(torch.abs(loss))
-        # loss = ((target_data - pulses) ** 2).mean()
-        loss = torch.square(torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean()
-        # loss = torch.mean(torch.square(torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))))
-        with torch.no_grad():
-            psnr = mse_to_psnr(((target_data - pulses) ** 2).mean())
+        pulses, dists, z_vals, weights = self.forward(ray_d, ray_o, ray_p)
 
         pdf_weights = weights + .00001
         pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-        density_entropy = torch.nanmean(-torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1))
+        density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
+        spans = z_vals[..., -1] - z_vals[..., 0]
+        density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
 
         density_std = self.sdf_network(eik_pts).std()
 
-        loss = loss + density_entropy + eik_loss
+        dloss = (density_entropy + eik_loss * self.eikonal_weight)
+
+        loss = torch.square(
+            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean() + dloss
+
+        with torch.no_grad():
+            psnr = mse_to_psnr(((target_data - pulses) ** 2).mean())
+
+        # Generate rays for random sampling
+        '''acc_norm = 1 / (ray_d.shape[0] / chunk_sz)
+        pulses_acc = torch.zeros_like(target_data)
+        for chunk in range(0, ray_d.shape[1], chunk_sz):
+            pulses, dists, z_vals, weights = self.forward(ray_d[:, chunk:chunk + chunk_sz], ray_o[:, chunk:chunk + chunk_sz], ray_p[:, chunk:chunk + chunk_sz])
+            pulses_acc = pulses_acc + pulses
+            pdf_weights = weights + .00001
+            pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
+            dists = z_vals[..., 1:] - z_vals[..., :-1]
+            dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
+            density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
+            spans = z_vals[..., -1] - z_vals[..., 0]
+            density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
+
+            density_std = self.sdf_network(eik_pts).std()
+
+            dloss = (density_entropy + eik_loss) * acc_norm
+
+
+            if do_train:
+                self.manual_backward(dloss, retain_graph=True)
+                # plot_grad_flow(self.named_parameters())
+        loss = torch.square(
+            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses_acc))).mean()
+
+        with torch.no_grad():
+            psnr = mse_to_psnr(((target_data - pulses_acc) ** 2).mean())'''
+
+        self.loss = loss
 
         loss_name = 'train_loss' if do_train else 'val_loss'
         self.log_dict({loss_name: loss, 'eik_loss': eik_loss, 'psnr': psnr, 'lr': self.lr_schedulers().get_last_lr()[0],
                        'density_std': density_std, 'density_entropy': density_entropy}, on_epoch=True,
-                      prog_bar=True, rank_zero_only=True)
-        if do_train:
-            self.manual_backward(loss, retain_graph=True)
-            self.clip_gradients(opt, gradient_clip_val=50, gradient_clip_algorithm='norm')
-            # plot_grad_flow(self.named_parameters())
-            opt.step()
-            self.lr_schedulers().step()
+                      prog_bar=True, rank_zero_only=True, sync_dist=True)
 
     # def on_fit_start(self) -> None:
     #     self.logger.log_graph(self, self.example_input_array())

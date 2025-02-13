@@ -809,7 +809,7 @@ def uniform_sample(ray_d, n_samples, near, far, randomized=False):
     return z_vals
 
 
-def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, eps=1e-3, max_iters=10, beta_iters=5, add_samples=32):
+def error_bound_sample(ray_d, ray_o, _beta, n_samples, near, far, sdf_network, eps=1e-3, max_iters=5, beta_iters=2, add_samples=32):
     beta0 = _beta.detach()
     z_vals = uniform_sample(ray_d, n_samples, near, far)
     samples, samples_idx = z_vals, None

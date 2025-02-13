@@ -69,14 +69,14 @@ sarnerf_params:
     pulse_std: 741815608.4201782
   # model hyperparams
   model:
-    num_samples: 32
-    fine_samples: 32
-    hidden: 128
-    param_hidden: 32
+    num_samples: 16
+    fine_samples: 16
+    hidden: 256
+    param_hidden: 128
     density_noise: 0.0
     density_bias: 0.0
-    encoder_sigma: 10.
-    encoder_size: 8
+    encoder_sigma: 33.
+    encoder_size: 10
     wavelength: 0.031228381041666666
     az_bw: 0.039269908169872414
     el_bw: 0.09599310885968812
@@ -100,7 +100,7 @@ sarnerf_params:
     ray_samples: 8192
     num_workers: 0
     single_example: False
-    distributed: False
+    distributed: True
   # visualization hyperparams
   visualization:
     chunks: 1024

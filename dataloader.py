@@ -6,6 +6,7 @@ from simulib.platform_helper import SDRPlatform
 from simulib.simulation_functions import azelToVec, findPowerOf2
 from sklearn.model_selection import train_test_split
 import cv2
+from torch import Tensor
 
 c0 = 299792458.0
 
@@ -508,9 +509,62 @@ class NeRFModule(LightningDataModule):
         return loader
 
 
+class BaseSDRDataset(Dataset):
+    def __init__(self, data: Tensor = None, pulses: Tensor = None, ray_samples: int = 1024, box: np.array = None,
+                 fc: float = 9.6e9, az_bw: float = 1., el_bw: float = 1.):
+        tran_gain_db = 25.
+        rec_gain_db = 25.
+        amp_gain_db = 50.
+        tran_power_watt = 100.
+        self.radar_coeff = np.float32(
+            c0 ** 2 / fc ** 2 * tran_power_watt * 10 ** (
+                    (tran_gain_db + 2.15) / 10) * 10 ** (
+                    (rec_gain_db + 2.15) / 10) *
+            10 ** ((amp_gain_db + 2.15) / 10) / (4 * np.pi) ** 3)
 
+        self.az_bw = az_bw
+        self.el_bw = el_bw
+        self.ray_samples = ray_samples
+        self.data = data
+        self.pulses = pulses
 
-class SDRPulseDataset(Dataset):
+        '''self.az_vals = torch.distributions.Uniform(-self.az_bw * 3, self.az_bw * 3)
+        self.el_vals = torch.distributions.Beta(1, 3)'''
+        self.x_vals = torch.distributions.Uniform(box[0, 0] + 1, box[1, 0] - 1)
+        self.y_vals = torch.distributions.Uniform(box[0, 1] + 1, box[1, 1] - 1)
+        self.z_vals = torch.distributions.Uniform(box[0, 2] + 1, box[1, 2] - 1)
+
+    def __getitem__(self, p_idx):
+        ray_d, ray_o, ray_p = self.generate_rays(self.data[p_idx])
+        return ray_d, ray_o, ray_p, self.pulses[p_idx]
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def generate_rays(self, ray_info):
+        # Generate random rays for sampling
+        x_vals = self.x_vals.rsample((self.ray_samples, 1))
+        y_vals = self.y_vals.rsample((self.ray_samples, 1))
+        z_vals = self.z_vals.rsample((self.ray_samples, 1))
+        vecs = torch.cat([x_vals - ray_info[..., 0], y_vals - ray_info[..., 1], z_vals - ray_info[..., 2]], dim=-1)
+        vecs = vecs / torch.linalg.norm(vecs, dim=-1)[:, None]
+        az_vals = torch.arctan2(vecs[:, 0], vecs[:, 1]).view(-1, 1)
+        el_vals = -torch.arcsin(vecs[:, 2]).view(-1, 1)
+        ray_p = torch.square(torch.sinc((az_vals - ray_info[..., 3]) / self.az_bw)) * torch.square(
+            torch.sinc((el_vals - ray_info[..., 4]) / self.el_bw)) * self.radar_coeff
+        '''az_vals = self.az_vals.rsample((self.ray_samples, 1))
+        el_vals = self.el_vals.rsample((self.ray_samples, 1)) * self.el_bw * 3 - self.el_bw
+        ray_p = torch.square(torch.sinc(az_vals / self.az_bw)) * torch.square(
+            torch.sinc(el_vals / self.el_bw)) * self.radar_coeff
+        az_vals = az_vals + ray_info[..., 3]
+        el_vals = el_vals + ray_info[..., 4]'''
+        ray_d = torch.cat(
+            [torch.sin(az_vals) * torch.cos(el_vals), torch.cos(az_vals) * torch.cos(el_vals), -torch.sin(el_vals)],
+            dim=-1)
+        ray_o = torch.broadcast_to(ray_info[..., :3], ray_d.shape)
+        return ray_d, ray_o, ray_p
+
+class SDRPulseDataset(BaseSDRDataset):
     def __init__(self, sdr_file: str, split: float = 1., data_center: list = None, ray_samples: int = 1024,
                  box: np.array = None, distributed: bool = False, is_val: bool = False, seed: int = 42):
         if distributed:
@@ -528,92 +582,71 @@ class SDRPulseDataset(Dataset):
         i_vals = Xs if is_val else Xt
         rp = SDRPlatform(sdr_f, origin=data_center, channel=0, fs=sdr_f[0].fs)
         fft_sz = findPowerOf2(sdr_f[0].nsam + sdr_f[0].pulse_length)
-        self.pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
+        pulses = np.fft.ifft(np.fft.fft(sdr_f.getPulses(sdr_f[0].frame_num[i_vals])[1], fft_sz, axis=0).T *
                                   sdr_f.genMatchedFilter(0, fft_len=fft_sz), axis=1)[:, :sdr_f[0].nsam]
         # Normalize pulses so that they have a standard deviation of one
-        pulse_std = self.pulses.std(axis=1)
+        pulse_std = pulses.std(axis=1)
+
         valids = abs(pulse_std - pulse_std.mean()) <= pulse_std.std()
-        self.pulses = self.pulses[valids]
-        self.pulses = self.pulses / np.std(self.pulses)
-        self.pulses = torch.view_as_real(torch.tensor(self.pulses))
+        pulses = pulses[valids]
+        self.pulse_std = np.std(pulses)
+        pulses = pulses / self.pulse_std
+        pulses = torch.view_as_real(torch.tensor(pulses))
 
         new_ivals = i_vals[valids]
-        self.pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float)
-        self.pans = torch.tensor(rp.pan(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
-        self.tilts = torch.tensor(rp.tilt(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
-        self.az_bw = np.float32(rp.az_half_bw)
-        self.el_bw = np.float32(rp.el_half_bw)
-        self.ray_samples = ray_samples
+        pos = torch.tensor(rp.txpos(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float)
+        pans = torch.tensor(rp.pan(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
+        tilts = torch.tensor(rp.tilt(sdr_f[0].pulse_time[new_ivals]), dtype=torch.float32)
 
         # Concatenate data for easier use
-        self.data = torch.cat([self.pos, self.pans.unsqueeze(-1), self.tilts.unsqueeze(-1)], dim=-1)
-        tran_gain_db = 25.
-        rec_gain_db = 25.
-        amp_gain_db = 50.
-        tran_power_watt = 100.
-        self.radar_coeff = np.float32(
-            c0 ** 2 / sdr_f[0].fc ** 2 * tran_power_watt * 10 ** (
-                    (tran_gain_db + 2.15) / 10) * 10 ** (
-                    (rec_gain_db + 2.15) / 10) *
-            10 ** ((amp_gain_db + 2.15) / 10) / (4 * np.pi) ** 3)
-
-        self.az_vals = torch.distributions.Uniform(-self.az_bw * 3, self.az_bw * 3)
-        self.el_vals = torch.distributions.Beta(1, 3)
-        '''self.x_vals = torch.distributions.Uniform(box[0, 0] + 1, box[1, 0] - 1)
-        self.y_vals = torch.distributions.Uniform(box[0, 1] + 1, box[1, 1] - 1)
-        self.z_vals = torch.distributions.Uniform(box[0, 2] + 1, box[1, 2] - 1)'''
-        # self.data.requires_grad_(True)
+        data = torch.cat([pos, pans.unsqueeze(-1), tilts.unsqueeze(-1)], dim=-1)
+        super().__init__(data, pulses, ray_samples, box, sdr_f[0].fc, np.float32(rp.az_half_bw), np.float32(rp.el_half_bw))
 
 
-    def __getitem__(self, p_idx):
-        ray_d, ray_o, ray_p = self.generate_rays(self.data[p_idx])
-        return ray_d, ray_o, ray_p, self.pulses[p_idx]
+class SDRFileDataset(BaseSDRDataset):
+    def __init__(self, sdr_file: str, split: float = 1., ray_samples: int = 1024, box: np.array = None,
+                 is_val: bool = False, seed: int = 42):
+        data, pulses, self.pulse_std, az_bw, el_bw, fc = torch.load(sdr_file)
 
-    def __len__(self):
-        return self.data.shape[0]
-
-    def generate_rays(self, ray_info):
-        # Generate random rays for sampling
-        '''x_vals = self.x_vals.rsample((self.ray_samples, 1))
-        y_vals = self.y_vals.rsample((self.ray_samples, 1))
-        z_vals = self.z_vals.rsample((self.ray_samples, 1))
-        vecs = torch.cat([x_vals - ray_info[..., 0], y_vals - ray_info[..., 1], z_vals - ray_info[..., 2]], dim=-1)
-        vecs = vecs / torch.linalg.norm(vecs, dim=-1)[:, None]
-        az_vals = torch.arctan2(vecs[:, 0], vecs[:, 1]).view(-1, 1)
-        el_vals = -torch.arcsin(vecs[:, 2]).view(-1, 1)
-        ray_p = torch.square(torch.sinc((az_vals - ray_info[..., 3]) / self.az_bw)) * torch.square(
-            torch.sinc((el_vals - ray_info[..., 4]) / self.el_bw)) * self.radar_coeff'''
-        az_vals = self.az_vals.rsample((self.ray_samples, 1))
-        el_vals = self.el_vals.rsample((self.ray_samples, 1)) * self.el_bw * 3 - self.el_bw / 2
-        ray_p = torch.square(torch.sinc(az_vals / self.az_bw)) * torch.square(
-            torch.sinc(el_vals / self.el_bw)) * self.radar_coeff
-        az_vals = az_vals + ray_info[..., 3]
-        el_vals = el_vals + ray_info[..., 4]
-        ray_d = torch.cat(
-            [torch.sin(az_vals) * torch.cos(el_vals), torch.cos(az_vals) * torch.cos(el_vals), -torch.sin(el_vals)],
-            dim=-1)
-        ray_o = torch.broadcast_to(ray_info[..., :3], ray_d.shape)
-        return ray_d, ray_o, ray_p
+        if split < 1:
+            Xs, Xt, ys, yt = train_test_split(data, pulses, test_size=split, random_state=seed)
+            data = Xs if is_val else Xt
+            pulses = ys if is_val else yt
+        else:
+            data = data
+            pulses = pulses
+        super().__init__(data, pulses, ray_samples, box, fc, az_bw, el_bw)
 
 
 class SARNeRFModule(LightningDataModule):
-    def __init__(self, config, bounding_box: np.array = None):
+    def __init__(self, config, bounding_box: np.array = None, use_data_file: str = None):
         super().__init__()
         self.config = config
         self.train_dataset = None
         self.val_dataset = None
         self.bounding_box = bounding_box
+        if use_data_file is not None:
+            self.use_data_file = True
+            self.data_fnme = use_data_file
+        else:
+            self.use_data_file = False
 
     def setup(self, stage: Optional[str] = None) -> None:
-        self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center,
-                                             ray_samples = self.config.ray_samples, box = self.bounding_box,
-                                             distributed = self.config.distributed, is_val=False, seed=42)
+        if self.use_data_file:
+            self.train_dataset = SDRFileDataset(self.data_fnme, self.config.split, self.config.ray_samples,
+                                                self.bounding_box, is_val=False, seed=42)
+            self.val_dataset = SDRFileDataset(self.data_fnme, self.config.split, self.config.ray_samples,
+                                                self.bounding_box, is_val=True, seed=42)
+        else:
+            self.train_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
+                                                 data_center = self.config.data_center,
+                                                 ray_samples = self.config.ray_samples, box = self.bounding_box,
+                                                 distributed = self.config.distributed, is_val=False, seed=42)
 
-        self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
-                                             data_center = self.config.data_center,
-                                           ray_samples = self.config.ray_samples, box = self.bounding_box,
-                                           distributed = self.config.distributed, is_val=True, seed=42)
+            self.val_dataset = SDRPulseDataset(sdr_file = self.config.sdr_file, split = self.config.split,
+                                                 data_center = self.config.data_center,
+                                               ray_samples = self.config.ray_samples, box = self.bounding_box,
+                                               distributed = self.config.distributed, is_val=True, seed=42)
 
 
     def train_dataloader(self) -> DataLoader:
