@@ -7,7 +7,7 @@ import matplotlib as mplib
 from pytorch_lightning.utilities import grad_norm
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from simulib.platform_helper import SDRPlatform
-from torch import optim, Tensor
+from torch import optim, Tensor, autocast
 from torch.optim import Optimizer
 from utils import sample_along_rays, resample_along_rays, volumetric_rendering, namedtuple_map, to8b, \
     plot_grad_flow, eikonal_loss, positional_encoding, laplace_cdf, error_bound_sample, uniform_sample
@@ -256,7 +256,7 @@ class SARNeRF(LightningModule):
         self.return_raw = return_raw
         # self.automatic_optimization = False
         self.scene_bbox = scene_bbox.astype(np.float32)
-        self.temperature = 1.
+        self.temperature = .1
         self.pulse_std = config.pulse_std
         self.eikonal_weight = config.eikonal_weight
         self.acc_weight = config.acc_weight
@@ -273,10 +273,6 @@ class SARNeRF(LightningModule):
         self.pulse_bins = torch.tensor(self.near_range + self.mpp * np.arange(self.nsam), dtype=torch.float32)
         self.az_bw = np.float32(rp.az_half_bw)
         self.el_bw = np.float32(rp.el_half_bw)
-
-        # Calculate radius of cone
-        self.radii = self.far_range * np.tan(min(self.az_bw, self.el_bw)) / self.ray_samples
-
 
         self.use_eik_base = False
         if eik_loss_baseline is not None:
@@ -306,7 +302,6 @@ class SARNeRF(LightningModule):
 
         self.beta = nn.Parameter(data=torch.Tensor([1.]), requires_grad=True)
         self.beta_pos = nn.Softplus()
-        self.approx_sign = nn.Sigmoid()
 
         _xavier_init(self)
 
@@ -328,7 +323,7 @@ class SARNeRF(LightningModule):
         near = near[:, hit_mask]
         far = far[:, hit_mask]
 
-        z_vals = uniform_sample(ray_d, self.num_samples, near, far)
+        z_vals = uniform_sample(ray_d, self.num_samples, near, far, randomized=True)
 
         # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
@@ -426,7 +421,7 @@ class SARNeRF(LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.train_val_get(batch, True)
-        if self.global_step % 100 == 0 and self.trainer.is_global_zero:
+        '''if self.global_step % 100 == 0 and self.trainer.is_global_zero:
             mplib.use('Agg')
             pts = torch.cat([self.eik_base, torch.rand(size=(self.eik_base.shape[0], 3)) *
                              np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]], dim=0).to(self.device)
@@ -442,7 +437,7 @@ class SARNeRF(LightningModule):
             ax.set_ylim(self.scene_bbox[0, 1], self.scene_bbox[1, 1])
             ax.set_zlim(self.scene_bbox[0, 2], self.scene_bbox[1, 2])
             self.logger.experiment.add_figure('Density Plot', fig, global_step=self.global_step)
-            plt.close(fig)
+            plt.close(fig)'''
         if self.automatic_optimization:
             return self.loss
 
@@ -499,34 +494,6 @@ class SARNeRF(LightningModule):
         with torch.no_grad():
             psnr = mse_to_psnr(((target_data - pulses) ** 2).mean())
 
-        # Generate rays for random sampling
-        '''acc_norm = 1 / (ray_d.shape[0] / chunk_sz)
-        pulses_acc = torch.zeros_like(target_data)
-        for chunk in range(0, ray_d.shape[1], chunk_sz):
-            pulses, dists, z_vals, weights = self.forward(ray_d[:, chunk:chunk + chunk_sz], ray_o[:, chunk:chunk + chunk_sz], ray_p[:, chunk:chunk + chunk_sz])
-            pulses_acc = pulses_acc + pulses
-            pdf_weights = weights + .00001
-            pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
-            dists = z_vals[..., 1:] - z_vals[..., :-1]
-            dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-            density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
-            spans = z_vals[..., -1] - z_vals[..., 0]
-            density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
-
-            density_std = self.sdf_network(eik_pts).std()
-
-            dloss = (density_entropy + eik_loss) * acc_norm
-
-
-            if do_train:
-                self.manual_backward(dloss, retain_graph=True)
-                # plot_grad_flow(self.named_parameters())
-        loss = torch.square(
-            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses_acc))).mean()
-
-        with torch.no_grad():
-            psnr = mse_to_psnr(((target_data - pulses_acc) ** 2).mean())'''
-
         self.loss = loss
 
         loss_name = 'train_loss' if do_train else 'val_loss'
@@ -566,9 +533,9 @@ class SDFNetwork(LightningModule):
         for i in range(3):
             self.hypernetwork.append(nn.Sequential(
                 nn.Linear(input_layer_sz if i == 0 else hidden + input_layer_sz, hidden),
-                nn.ReLU(),
+                nn.Softplus(),
             ))
-            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden, w0=30. if i == 0 else 1., is_first = i == 0))
+            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden, w0=30. if i == 0 else 10., is_first = i == 0))
         self.final_sdf = nn.Sequential(
             nn.Linear(hidden, 1),
         )
