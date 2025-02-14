@@ -100,7 +100,7 @@ sarnerf_params:
     ray_samples: 8192
     num_workers: 0
     single_example: False
-    distributed: True
+    distributed: False
   # visualization hyperparams
   visualization:
     chunks: 1024

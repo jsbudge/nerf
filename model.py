@@ -284,7 +284,7 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        self.use_eik_base = False
+        # self.use_eik_base = False
 
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
 
@@ -328,9 +328,9 @@ class SARNeRF(LightningModule):
         near = near[:, hit_mask]
         far = far[:, hit_mask]
 
-        # z_vals = uniform_sample(ray_d, self.num_samples, near, far)
+        z_vals = uniform_sample(ray_d, self.num_samples, near, far)
 
-        z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
+        # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
         pts = pts.reshape(-1, 3)
         pts.requires_grad_(True)
@@ -350,7 +350,7 @@ class SARNeRF(LightningModule):
         enc_mean = positional_encoding(pts, self.sigma, self.encoder_size)
         params = self.param0(latent_features)
         params = torch.cat([params, enc_mean], dim=-1)
-        params = self.param1(params).reshape((ray_o.shape[0], -1, self.fine_samples, 2)) + .001
+        params = self.param1(params).reshape((ray_o.shape[0], -1, self.num_samples, 2)) + .001
         acc = torch.sum(weights, dim=-1)
         distance = torch.sum(weights * z_vals, dim=-1) / acc
         distance = torch.clamp(torch.nan_to_num(distance), z_vals[..., 0], z_vals[..., -1])
