@@ -72,7 +72,7 @@ sarnerf_params:
     num_samples: 16
     fine_samples: 16
     hidden: 256
-    param_hidden: 128
+    param_hidden: 256
     density_noise: 0.0
     density_bias: 0.0
     encoder_sigma: 33.
@@ -87,7 +87,7 @@ sarnerf_params:
     lr_final: .00005
     lr_delay_steps: 10000
     lr_delay_mult: 0.1
-    weight_decay: 0.00001
+    weight_decay: 0.0001
     eikonal_weight: .1
     acc_weight: 1.
   # training hyperparams
@@ -97,7 +97,7 @@ sarnerf_params:
     max_steps: -1
     batch_size: 1
     device: cuda
-    ray_samples: 8192
+    ray_samples: 100000
     num_workers: 0
     single_example: False
     distributed: False

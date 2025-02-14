@@ -246,7 +246,7 @@ class SARNeRF(LightningModule):
         self.ray_samples = config.ray_samples
         self.num_samples = config.num_samples
         self.fine_samples = config.fine_samples
-        self.density_input = config.encoder_size * 3 * 2
+        self.density_input = config.encoder_size * 3 * 4
         self.density_noise = config.density_noise
         self.rgb_padding = config.rgb_padding
         self.resample_padding = config.resample_padding
@@ -256,7 +256,7 @@ class SARNeRF(LightningModule):
         self.return_raw = return_raw
         # self.automatic_optimization = False
         self.scene_bbox = scene_bbox.astype(np.float32)
-        self.temperature = 1.
+        self.temperature = .1
         self.pulse_std = config.pulse_std
         self.eikonal_weight = config.eikonal_weight
         self.acc_weight = config.acc_weight
@@ -274,22 +274,28 @@ class SARNeRF(LightningModule):
         self.az_bw = np.float32(rp.az_half_bw)
         self.el_bw = np.float32(rp.el_half_bw)
 
-        # Calculate radius of cone
-        self.radii = self.far_range * np.tan(min(self.az_bw, self.el_bw)) / self.ray_samples
+        self.sdf0 = nn.Sequential(
+            nn.Linear(self.density_input, config.hidden),
+            nn.SiLU(),
+            nn.Linear(config.hidden, config.hidden),
+            nn.SiLU(),
+            nn.Linear(config.hidden, config.hidden),
+            nn.SiLU(),
+        )
 
-
-        self.use_eik_base = False
-        if eik_loss_baseline is not None:
-            self.use_eik_base = True
-            self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
-        else:
-            self.use_eik_base = False
-        # self.use_eik_base = False
-
-        self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
+        self.sdf1 = nn.Sequential(
+            nn.Linear(config.hidden + self.density_input, config.hidden),
+            nn.SiLU(),
+            nn.Linear(config.hidden, config.hidden),
+            nn.SiLU(),
+            nn.Linear(config.hidden, 1),
+            nn.ReLU(),
+        )
 
         self.param0 = nn.Sequential(
-            nn.Linear(config.hidden, config.param_hidden),
+            nn.Linear(self.density_input, config.param_hidden),
+            nn.SiLU(),
+            nn.Linear(config.param_hidden, config.param_hidden),
             nn.SiLU(),
             nn.Linear(config.param_hidden, config.param_hidden),
             nn.SiLU(),
@@ -300,13 +306,9 @@ class SARNeRF(LightningModule):
             nn.SiLU(),
             nn.Linear(config.param_hidden, config.param_hidden),
             nn.SiLU(),
-            nn.Linear(config.param_hidden, 2),
-            nn.Softplus(),
+            nn.Linear(config.param_hidden, 1),
+            nn.Sigmoid(),
         )
-
-        self.beta = nn.Parameter(data=torch.Tensor([1.]), requires_grad=True)
-        self.beta_pos = nn.Softplus()
-        self.approx_sign = nn.Sigmoid()
 
         _xavier_init(self)
 
@@ -314,69 +316,33 @@ class SARNeRF(LightningModule):
 
     def forward(self, ray_d, ray_o, ray_p, return_occ=False):
         # Calculate sphere intersections for near and far
-        bb_enter, bb_leave, hits = self.bb_intersect(ray_o.reshape(-1, 3), ray_d.reshape(-1, 3))
-        pulse_bins = self.pulse_bins.to(self.device)
-        near = bb_enter.view(ray_p.shape)
-        far = bb_leave.view(ray_p.shape)
-        # near = torch.clamp_(bb_enter.view(ray_p.shape), self.near_range, self.far_range - 1)
-        # far = torch.clamp_(bb_leave.view(ray_p.shape), self.near_range, self.far_range)
-
-        hit_mask = hits.squeeze(-1)
-        ray_d = ray_d[:, hit_mask]
-        ray_o = ray_o[:, hit_mask]
-        ray_p = ray_p[:, hit_mask]
-        near = near[:, hit_mask]
-        far = far[:, hit_mask]
-
-        z_vals = uniform_sample(ray_d, self.num_samples, near, far)
+        pos_enc = positional_encoding(torch.cat([ray_o, ray_d], dim=-1), self.sigma, self.encoder_size)
+        distance = self.sdf0(pos_enc)
+        distance = torch.cat([distance, pos_enc], dim=-1)
+        distance = self.sdf1(distance) * self.mpp + self.near_range
 
         # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
-        pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
-        pts = pts.reshape(-1, 3)
-        pts.requires_grad_(True)
-        latent_features, sdf = self.sdf_network(pts, get_features=True)
-        density = laplace_cdf(sdf.reshape(z_vals.shape), self.get_beta())
-
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-        free_energy = dists * density
-        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]],
-                                        dim=-1)
-        alpha = 1 - torch.exp(-free_energy)
-        transmittance = torch.exp(-torch.cumsum(shifted_free_energy, dim=-1))
-        weights = alpha * transmittance  # probability of the ray hits something here
+        pts = ray_o + ray_d * distance
 
         # predict params and reshape for use later
-        enc_mean = positional_encoding(pts, self.sigma, self.encoder_size)
-        params = self.param0(latent_features)
-        params = torch.cat([params, enc_mean], dim=-1)
-        params = self.param1(params).reshape((ray_o.shape[0], -1, self.num_samples, 2)) + .001
-        acc = torch.sum(weights, dim=-1)
-        distance = torch.sum(weights * z_vals, dim=-1) / acc
-        distance = torch.clamp(torch.nan_to_num(distance), z_vals[..., 0], z_vals[..., -1])
-        params = torch.sum(weights[..., None] * params, dim=-2) / acc[..., None]
-
-        # Detach gradients from autograd so they don't influence backpropagation
-        pts.requires_grad_(True)
-        gradients = diff_ops.gradient(sdf, pts).detach().reshape(*z_vals.shape, 3)
-        with torch.no_grad():
-            normals = torch.sum(weights[..., None] * gradients, dim=-2) / acc[..., None]
-            normals = torch.nan_to_num(-normals / normals.norm(2, -1, keepdim=True), 0)
-            bounce = normals * torch.sum(ray_d * normals, dim=-1)[..., None] * 2 - ray_d
+        param_enc = positional_encoding(torch.cat([pts, ray_d], dim=-1), self.sigma, self.encoder_size)
+        params = self.param0(param_enc)
+        params = torch.cat([params, param_enc], dim=-1)
+        params = self.param1(params) + .001
 
         # Phong reflection formulation, phong to be added later
         '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
             torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1)'''
-        ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1) / 16.
+        ref_model = params / distance ** 4 * ray_p
         # ref_model = ray_p.squeeze(-1) / torch.square(distance)
 
         # Get soft buckets to preserve gradients across histogramming step
-        bound_dist = torch.abs(distance.unsqueeze(-1) - pulse_bins.unsqueeze(0))
+        pulse_bins = self.pulse_bins.to(self.device)
+        bound_dist = torch.abs(distance - pulse_bins.unsqueeze(0))
         soft_buckets = torch.softmax(-bound_dist / self.temperature, dim=-1)
 
         # Calculate out expected phase as well
-        ret = torch.view_as_real(ref_model * torch.exp(-4j * torch.pi / self.wavelength * distance))
+        ret = torch.view_as_real(ref_model.squeeze(-1) * torch.exp(-4j * torch.pi / self.wavelength * distance.squeeze(-1)))
 
         # Soft histogram step, along with applying filtered chirp in frequency domain
         comp_pulse = ret[:, :, None, :] * soft_buckets[:, :, :, None]
@@ -386,34 +352,11 @@ class SARNeRF(LightningModule):
                                     self.mfilt.to(self.device), dim=-1)[..., :self.nsam]
         comp_pulse = torch.view_as_real(comp_pulse) / self.pulse_std
         if return_occ:
-            return sdf.reshape((ray_o.shape[0], -1, self.num_samples, 1)), z_vals, density.reshape((ray_o.shape[0], -1, self.num_samples, 1)), weights
+            return distance
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
-            return comp_pulse, distance, z_vals, weights
+            return comp_pulse, distance, pts
             # return sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1))
-
-    def get_beta(self):
-        return .0001 + self.beta_pos(self.beta)
-
-
-    def sample_density_function(self, x_range: list = None, y_range: list = None, z_range: list = None,
-                                npts: list = None, pts: Tensor = None) -> (Tensor, Tensor):
-        # If we don't want to give a set of points, generate a cube based on ranges given
-        if pts is None:
-            x, y, z = torch.meshgrid(torch.linspace(x_range[0], x_range[1], npts[0], dtype=torch.float32).to(self.device),
-                                     torch.linspace(y_range[0], y_range[1], npts[1], dtype=torch.float32).to(self.device),
-                                     torch.linspace(z_range[0], z_range[1], npts[2], dtype=torch.float32).to(self.device))
-            pts = torch.cat([x.reshape(-1, 1), y.reshape(-1, 1), z.reshape(-1, 1)], dim=1)
-            r_shape = x.shape
-        else:
-            r_shape = pts.shape[:-1]
-        # Adding normals in here to give another thing to plot
-        pts.requires_grad_(True)
-        sdf = self.sdf_network(pts)
-        normals = diff_ops.gradient(sdf, pts).detach()
-        with torch.no_grad():
-            normals = torch.nan_to_num(normals / normals.norm(2, -1, keepdim=True), 0)
-        return sdf.reshape(r_shape), normals.reshape((*r_shape, 3))
 
 
     def configure_optimizers(self):
@@ -425,19 +368,14 @@ class SARNeRF(LightningModule):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def training_step(self, batch, batch_idx):
-        self.train_val_get(batch, True)
+        pts = self.train_val_get(batch, True)
         if self.global_step % 100 == 0 and self.trainer.is_global_zero:
             mplib.use('Agg')
-            pts = torch.cat([self.eik_base, torch.rand(size=(self.eik_base.shape[0], 3)) *
-                             np.diff(self.scene_bbox, axis=0) + self.scene_bbox[0]], dim=0).to(self.device)
-
-            sdf_test, norm_test = self.sample_density_function(pts=pts)
-            sdf_test = laplace_cdf(sdf_test, self.get_beta()).cpu().data.numpy().flatten()
             pts_np = pts.cpu().data.numpy()
 
             fig = plt.figure()
             ax = fig.add_subplot(projection='3d')
-            ax.scatter(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], s=sdf_test)
+            ax.scatter(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2])
             ax.set_xlim(self.scene_bbox[0, 0], self.scene_bbox[1, 0])
             ax.set_ylim(self.scene_bbox[0, 1], self.scene_bbox[1, 1])
             ax.set_zlim(self.scene_bbox[0, 2], self.scene_bbox[1, 2])
@@ -461,78 +399,22 @@ class SARNeRF(LightningModule):
 
     def train_val_get(self, batch, do_train = True):
         ray_d, ray_o, ray_p, target_data = batch
-        # chunk_sz = 1024
 
-        # Calculate out Eikonal loss
-        if self.use_eik_base:
-            eik_pts = (torch.rand(size=(self.eik_base.shape[0], 3)) * np.diff(self.scene_bbox, axis=0) +
-                       self.scene_bbox[0]).to(self.device)
-            eik_loss = (torch.exp(-10. * torch.abs(self.sdf_network(eik_pts))).sum() + torch.abs(
-                self.sdf_network(self.eik_base.to(self.device))).sum())
-            eik_pts = torch.cat([eik_pts, self.eik_base.to(self.device)], dim=0)
-        else:
-            eik_pts = (torch.rand(size=(ray_d.shape[1] * 2, 3)) * np.diff(self.scene_bbox, axis=0) + self.scene_bbox[
-                0]).to(
-                self.device)
-            eik_loss = 0.
-        eik_pts.requires_grad_(True)
-        grad_theta = diff_ops.gradient(self.sdf_network(eik_pts), eik_pts)
-        eik_loss = eikonal_loss(grad_theta) + eik_loss
-
-        pulses, dists, z_vals, weights = self.forward(ray_d, ray_o, ray_p)
-
-        pdf_weights = weights + .00001
-        pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-        density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
-        spans = z_vals[..., -1] - z_vals[..., 0]
-        density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
-
-        density_std = self.sdf_network(eik_pts).std()
-
-        dloss = (density_entropy + eik_loss * self.eikonal_weight)
+        pulses, dists, pts = self.forward(ray_d, ray_o, ray_p)
 
         loss = torch.square(
-            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean() + dloss
+            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean()
 
         with torch.no_grad():
             psnr = mse_to_psnr(((target_data - pulses) ** 2).mean())
 
-        # Generate rays for random sampling
-        '''acc_norm = 1 / (ray_d.shape[0] / chunk_sz)
-        pulses_acc = torch.zeros_like(target_data)
-        for chunk in range(0, ray_d.shape[1], chunk_sz):
-            pulses, dists, z_vals, weights = self.forward(ray_d[:, chunk:chunk + chunk_sz], ray_o[:, chunk:chunk + chunk_sz], ray_p[:, chunk:chunk + chunk_sz])
-            pulses_acc = pulses_acc + pulses
-            pdf_weights = weights + .00001
-            pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
-            dists = z_vals[..., 1:] - z_vals[..., :-1]
-            dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-            density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
-            spans = z_vals[..., -1] - z_vals[..., 0]
-            density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
-
-            density_std = self.sdf_network(eik_pts).std()
-
-            dloss = (density_entropy + eik_loss) * acc_norm
-
-
-            if do_train:
-                self.manual_backward(dloss, retain_graph=True)
-                # plot_grad_flow(self.named_parameters())
-        loss = torch.square(
-            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses_acc))).mean()
-
-        with torch.no_grad():
-            psnr = mse_to_psnr(((target_data - pulses_acc) ** 2).mean())'''
-
         self.loss = loss
 
         loss_name = 'train_loss' if do_train else 'val_loss'
-        self.log_dict({loss_name: loss, 'eik_loss': eik_loss, 'psnr': psnr, 'lr': self.lr_schedulers().get_last_lr()[0],
-                       'density_std': density_std, 'density_entropy': density_entropy}, on_epoch=True,
+        self.log_dict({loss_name: loss, 'psnr': psnr, 'lr': self.lr_schedulers().get_last_lr()[0]}, on_epoch=True,
                       prog_bar=True, rank_zero_only=True, sync_dist=True)
+
+        return pts
 
     # def on_fit_start(self) -> None:
     #     self.logger.log_graph(self, self.example_input_array())
@@ -541,108 +423,5 @@ class SARNeRF(LightningModule):
         norms = grad_norm(self, norm_type=2)  # Compute 2-norm for each layer
         self.log_dict(norms)
 
-    def bb_intersect(self, ray_o, ray_d):
-        with torch.no_grad():
-            tmin = (torch.tensor(self.scene_bbox[0], device=self.device) - ray_o) / ray_d
-            tmax = (torch.tensor(self.scene_bbox[1], device=self.device) - ray_o) / ray_d
-            t1 = torch.min(tmin, tmax)
-            t2 = torch.max(tmin, tmax)
-            tnear = torch.max(t1, dim=-1)[0]
-            tfar = torch.min(t2, dim=-1)[0]
-            hits = torch.logical_and(tnear - tfar < 0, tfar >= 0)
-        return tnear, tfar, hits# torch.logical_and(hits, tnear < self.far_range)
-
-
-
-class SDFNetwork(LightningModule):
-
-    def __init__(self, encoder_sigma: float = 10., encoder_size: int = 10, hidden: int = 256, input_layer_sz: int = 6,
-                 *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.enc_sig = encoder_sigma
-        self.enc_sz = encoder_size
-        self.hypernetwork = nn.ModuleList()
-        self.sdf_net = nn.ModuleList()
-        for i in range(3):
-            self.hypernetwork.append(nn.Sequential(
-                nn.Linear(input_layer_sz if i == 0 else hidden + input_layer_sz, hidden),
-                nn.ReLU(),
-            ))
-            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden, w0=30. if i == 0 else 1., is_first = i == 0))
-        self.final_sdf = nn.Sequential(
-            nn.Linear(hidden, 1),
-        )
-
-        _xavier_init(self)
-
-    def forward(self, x, get_features=False):
-        enc = positional_encoding(x, self.enc_sig, self.enc_sz)
-        enc = enc.reshape((-1, enc.shape[-1]))
-        init_enc = enc
-        for i, (hyp, sir) in enumerate(zip(self.hypernetwork, self.sdf_net)):
-            henc = hyp(init_enc) if i == 0 else hyp(torch.cat([henc, init_enc], dim=-1))
-            enc = sir(enc) * henc
-        # predict density
-        return (enc, self.final_sdf(enc)) if get_features else self.final_sdf(enc)
-
 def mse_to_psnr(mse):
     return -10.0 * torch.log10(mse)
-
-
-class Sine(nn.Module):
-    def __init__(self, w0=1.0):
-        super().__init__()
-        self.w0 = w0
-
-    def forward(self, x):
-        return torch.sin(self.w0 * x)
-
-
-class Siren(nn.Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_out,
-        w0 = 1.,
-        c = 6.,
-        is_first = False,
-        use_bias = True,
-        activation = None,
-        dropout = .25
-    ):
-        super().__init__()
-        self.dim_in = dim_in
-        self.is_first = is_first
-
-        weight0 = torch.zeros(dim_out, dim_in)
-        weight1 = torch.zeros(dim_out, dim_in)
-        weightquad = torch.zeros(dim_out, dim_in)
-        bias0 = torch.zeros(dim_out) if use_bias else None
-        bias1 = torch.zeros(dim_out) if use_bias else None
-        biasquad = torch.zeros(dim_out) if use_bias else None
-
-        w_std = (1 / dim_in) if self.is_first else (math.sqrt(c / dim_in) / w0)
-        weight0.uniform_(-w_std, w_std)
-        weight1.uniform_(-w_std, w_std)
-        weightquad.uniform_(-w_std, w_std)
-
-        if bias0 is not None:
-            bias0.uniform_(-w_std, w_std)
-            bias1.uniform_(-w_std, w_std)
-            biasquad.uniform_(-w_std, w_std)
-
-        self.weight0 = nn.Parameter(weight0)
-        self.weight1 = nn.Parameter(weight1)
-        self.weightquad = nn.Parameter(weightquad)
-        self.bias0 = nn.Parameter(bias0) if use_bias else None
-        self.bias1 = nn.Parameter(bias1) if use_bias else None
-        self.biasquad = nn.Parameter(biasquad) if use_bias else None
-        self.activation = Sine(w0) if activation is None else activation
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # out = nn.functional.linear(x, self.weight0, self.bias0)
-        out =  nn.functional.linear(x, self.weight0, self.bias0) * nn.functional.linear(x, self.weight1, self.bias1) + nn.functional.linear(torch.square(x), self.weightquad, self.biasquad)
-        out = self.activation(out)
-        out = self.dropout(out)
-        return out
