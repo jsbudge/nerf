@@ -363,7 +363,7 @@ class SARNeRF(LightningModule):
         '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
             torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1)'''
         ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1) / 16.
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1) / 16.
         # ref_model = ray_p.squeeze(-1) / torch.square(distance)
 
         # Get soft buckets to preserve gradients across histogramming step

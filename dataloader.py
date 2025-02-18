@@ -512,8 +512,8 @@ class NeRFModule(LightningDataModule):
 class BaseSDRDataset(Dataset):
     def __init__(self, data: Tensor = None, pulses: Tensor = None, ray_samples: int = 1024, box: np.array = None,
                  fc: float = 9.6e9, az_bw: float = 1., el_bw: float = 1.):
-        tran_gain_db = 25.
-        rec_gain_db = 25.
+        tran_gain_db = 30.
+        rec_gain_db = 30.
         amp_gain_db = 50.
         tran_power_watt = 100.
         self.radar_coeff = np.float32(
