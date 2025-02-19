@@ -223,8 +223,13 @@ if __name__ == '__main__':
                 density_cubes[x:x+50, y:y+50, :] = laplace_cdf(sdf_cubes, model.get_beta()).cpu().data.numpy()
         vertices, triangles = mcubes.marching_cubes(density_cubes, 1.)
 
-        fig = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2])])
-        fig.show()
+        if len(vertices) > 0:
+            import trimesh
+            mesh = trimesh.Trimesh(vertices=vertices, faces=triangles)
+            mesh.show()
+
+            # fig = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2])])
+            # fig.show()
 
 
 

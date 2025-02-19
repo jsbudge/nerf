@@ -280,7 +280,7 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        # self.use_eik_base = False
+        self.use_eik_base = False
 
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
 
@@ -323,29 +323,27 @@ class SARNeRF(LightningModule):
         near = near[:, hit_mask]
         far = far[:, hit_mask]
 
-        z_vals = uniform_sample(ray_d, self.num_samples, near, far, randomized=True)
+        ez_vals = uniform_sample(ray_d, self.num_samples, near, far, randomized=True)
+        pts = ray_o[..., None, :] + ray_d[..., None, :] * ez_vals[..., None]
+        pts = pts.reshape(-1, 3)
+        pts.requires_grad_(True)
+        latent_features, sdf = self.sdf_network(pts, get_features=True)
+        density = laplace_cdf(sdf.reshape(ez_vals.shape), self.get_beta())
+        eweights = self.get_weights(density, ez_vals)
 
-        # z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.num_samples, near, far, self.sdf_network)
+        z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.fine_samples, near, far, self.sdf_network)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
         pts = pts.reshape(-1, 3)
         pts.requires_grad_(True)
         latent_features, sdf = self.sdf_network(pts, get_features=True)
         density = laplace_cdf(sdf.reshape(z_vals.shape), self.get_beta())
-
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-        free_energy = dists * density
-        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]],
-                                        dim=-1)
-        alpha = 1 - torch.exp(-free_energy)
-        transmittance = torch.exp(-torch.cumsum(shifted_free_energy, dim=-1))
-        weights = alpha * transmittance  # probability of the ray hits something here
+        weights = self.get_weights(density, z_vals)
 
         # predict params and reshape for use later
         enc_mean = positional_encoding(pts, self.sigma, self.encoder_size)
         params = self.param0(latent_features)
         params = torch.cat([params, enc_mean], dim=-1)
-        params = self.param1(params).reshape((ray_o.shape[0], -1, self.num_samples, 2)) + .001
+        params = self.param1(params).reshape((ray_o.shape[0], -1, self.fine_samples, 2)) + .001
         acc = torch.sum(weights, dim=-1)
         distance = torch.sum(weights * z_vals, dim=-1) / acc
         distance = torch.clamp(torch.nan_to_num(distance), z_vals[..., 0], z_vals[..., -1])
@@ -375,20 +373,30 @@ class SARNeRF(LightningModule):
 
         # Soft histogram step, along with applying filtered chirp in frequency domain
         comp_pulse = ret[:, :, None, :] * soft_buckets[:, :, :, None]
-        comp_pulse = torch.sum(comp_pulse, dim=-3)
+        comp_pulse = torch.sum(comp_pulse, dim=-3) / (1e-12 + torch.sum(soft_buckets, dim=-2))[..., None]
         comp_pulse = torch.view_as_complex(comp_pulse)
         comp_pulse = torch.fft.ifft(torch.fft.fft(comp_pulse, self.mfilt.shape[-1], dim=-1) *
                                     self.mfilt.to(self.device), dim=-1)[..., :self.nsam]
         comp_pulse = torch.view_as_real(comp_pulse) / self.pulse_std
         if return_occ:
-            return sdf.reshape((ray_o.shape[0], -1, self.num_samples, 1)), z_vals, density.reshape((ray_o.shape[0], -1, self.num_samples, 1)), weights
+            return sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1)), z_vals, density.reshape((ray_o.shape[0], -1, self.fine_samples, 1)), weights
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
-            return comp_pulse, distance, z_vals, weights
+            return comp_pulse, distance, ez_vals, eweights
             # return sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1))
 
     def get_beta(self):
         return .0001 + self.beta_pos(self.beta)
+
+    def get_weights(self, density, z_vals):
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
+        free_energy = dists * density
+        shifted_free_energy = torch.cat([torch.zeros(*dists.shape[:-1], 1).to(dists.device), free_energy[..., :-1]],
+                                        dim=-1)
+        alpha = 1 - torch.exp(-free_energy)
+        transmittance = torch.exp(-torch.cumsum(shifted_free_energy, dim=-1))
+        return alpha * transmittance  # probability of the ray hits something here
 
 
     def sample_density_function(self, x_range: list = None, y_range: list = None, z_range: list = None,
@@ -486,7 +494,7 @@ class SARNeRF(LightningModule):
 
         density_std = self.sdf_network(eik_pts).std()
 
-        dloss = (density_entropy + eik_loss * self.eikonal_weight)
+        dloss = density_entropy + eik_loss * self.eikonal_weight
 
         loss = torch.square(
             torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean() + dloss

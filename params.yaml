@@ -70,8 +70,8 @@ sarnerf_params:
   # model hyperparams
   model:
     num_samples: 64
-    fine_samples: 64
-    hidden: 64
+    fine_samples: 16
+    hidden: 100
     param_hidden: 64
     density_noise: 0.0
     density_bias: 0.0
