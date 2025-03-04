@@ -236,43 +236,28 @@ def _xavier_init(model):
 
 
 class SARNeRF(LightningModule):
-    def __init__(self, config=None, return_raw: bool = False, eik_loss_baseline: np.array = None,
-                 scene_bbox: np.array = None, *args: Any, **kwargs: Any):
+    def __init__(self, config=None, eik_loss_baseline: np.array = None,
+                 scene_bbox: np.array = None, mfilt: Tensor = None, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.config = config
-        self.init_randomized = config.randomized
-        self.randomized = config.randomized
-        self.num_levels = config.num_levels
-        self.ray_samples = config.ray_samples
         self.num_samples = config.num_samples
         self.fine_samples = config.fine_samples
         self.density_input = config.encoder_size * 3 * 2
-        self.density_noise = config.density_noise
-        self.rgb_padding = config.rgb_padding
-        self.resample_padding = config.resample_padding
-        self.density_bias = config.density_bias
         self.hidden = config.hidden
         self.wavelength = config.wavelength
-        self.return_raw = return_raw
         # self.automatic_optimization = False
         self.scene_bbox = scene_bbox.astype(np.float32)
         self.temperature = .1
         self.pulse_std = config.pulse_std
         self.eikonal_weight = config.eikonal_weight
-        self.acc_weight = config.acc_weight
         self.sigma = config.encoder_sigma
         self.encoder_size = config.encoder_size
 
-        sdr_f = load(config.sdr_file)
-        rp = SDRPlatform(sdr_f, origin=config.data_center, channel=0, fs=sdr_f[0].fs)
-        self.nsam, _, pulse_bins, _, near_range_s, _, fft_sz, _ = rp.getRadarParams(0., 0., 1)
-        self.near_range = np.float32(near_range_s * c0)
-        self.mpp = np.float32(c0 / rp.fs / 2)
-        self.far_range = np.float32(self.near_range + self.nsam * self.mpp)
-        self.mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_sz) * np.fft.fft(sdr_f[0].cal_chirp, fft_sz), dtype=torch.complex64)
-        self.pulse_bins = torch.tensor(self.near_range + self.mpp * np.arange(self.nsam), dtype=torch.float32)
-        self.az_bw = np.float32(rp.az_half_bw)
-        self.el_bw = np.float32(rp.el_half_bw)
+        self.mfilt = mfilt
+        self.nsam = config.nsam
+        self.pulse_bins = torch.tensor(config.near_range + config.mpp * np.arange(config.nsam), dtype=torch.float32)
+        self.az_bw = np.float32(config.az_half_bw)
+        self.el_bw = np.float32(config.el_half_bw)
 
         self.use_eik_base = False
         if eik_loss_baseline is not None:
@@ -280,27 +265,28 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        self.use_eik_base = False
+        # self.use_eik_base = False
 
-        self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input)
+        self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input,
+                                      config.init_siren, config.hidden_siren, config.network_depth)
 
         self.param0 = nn.Sequential(
             nn.Linear(config.hidden, config.param_hidden),
-            nn.SiLU(),
+            nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
             nn.Linear(config.param_hidden, config.param_hidden),
-            nn.SiLU(),
+            nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
         )
 
         self.param1 = nn.Sequential(
             nn.Linear(config.param_hidden + self.density_input, config.param_hidden),
-            nn.SiLU(),
+            nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
             nn.Linear(config.param_hidden, config.param_hidden),
-            nn.SiLU(),
+            nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
             nn.Linear(config.param_hidden, 2),
             nn.Softplus(),
         )
 
-        self.beta = nn.Parameter(data=torch.Tensor([1.]), requires_grad=True)
+        self.beta = nn.Parameter(data=torch.Tensor([config.beta0]), requires_grad=True)
         self.beta_pos = nn.Softplus()
 
         _xavier_init(self)
@@ -486,11 +472,7 @@ class SARNeRF(LightningModule):
 
         pdf_weights = weights + .00001
         pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.zeros(*dists.shape[:-1], 1).to(dists.device)], -1)
-        density_entropy = -torch.sum(torch.log2(pdf_weights) * pdf_weights * dists, dim=-1)
-        spans = z_vals[..., -1] - z_vals[..., 0]
-        density_entropy = torch.sum(density_entropy * spans) / torch.sum(spans)
+        density_entropy = torch.mean(torch.sum(torch.log(pdf_weights * self.fine_samples) * pdf_weights, dim=-1))
 
         density_std = self.sdf_network(eik_pts).std()
 
@@ -513,8 +495,9 @@ class SARNeRF(LightningModule):
     #     self.logger.log_graph(self, self.example_input_array())
 
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        norms = grad_norm(self, norm_type=2)  # Compute 2-norm for each layer
-        self.log_dict(norms)
+        pass
+        # norms = grad_norm(self, norm_type=2)  # Compute 2-norm for each layer
+        # self.log_dict(norms)
 
     def bb_intersect(self, ray_o, ray_d):
         with torch.no_grad():
@@ -532,18 +515,19 @@ class SARNeRF(LightningModule):
 class SDFNetwork(LightningModule):
 
     def __init__(self, encoder_sigma: float = 10., encoder_size: int = 10, hidden: int = 256, input_layer_sz: int = 6,
-                 *args: Any, **kwargs: Any):
+                 init_siren: float = 30., hidden_siren: float = 10., network_depth: int = 3, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.enc_sig = encoder_sigma
         self.enc_sz = encoder_size
         self.hypernetwork = nn.ModuleList()
         self.sdf_net = nn.ModuleList()
-        for i in range(3):
+        for i in range(network_depth):
             self.hypernetwork.append(nn.Sequential(
                 nn.Linear(input_layer_sz if i == 0 else hidden + input_layer_sz, hidden),
                 nn.Softplus(),
             ))
-            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden, w0=30. if i == 0 else 10., is_first = i == 0))
+            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden,
+                                      w0=init_siren if i == 0 else hidden_siren, is_first = i == 0))
         self.final_sdf = nn.Sequential(
             nn.Linear(hidden, 1),
         )

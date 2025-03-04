@@ -65,7 +65,8 @@ if __name__ == '__main__':
     glat, glon, galt = enu2llh(gx.flatten(), gy.flatten(), gz.flatten(), bg.ref)
     gx, gy, gz = llh2enu(glat, glon, galt, rp.origin)
 
-
+    mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_len) * np.fft.fft(sdr_f[0].cal_chirp, fft_len),
+                         dtype=torch.complex64)
 
     # Only get the ones inside the scene sphere
     gpts = np.dstack((gx, gy, gz))[0]
@@ -91,11 +92,19 @@ if __name__ == '__main__':
                           devices=[1], num_sanity_val_steps=0, check_val_every_n_epoch=20000)
 
     print('Loading model...')
-    model = SARNeRF(
-        config=config,
-        eik_loss_baseline=gpts,
-        scene_bbox=bounding_box,
-    )
+    if config.warm_start:
+        model = SARNeRF.load_from_checkpoint(f'{config.model_weights_path}/{config.model_name}.ckpt', config=config,
+                                             eik_loss_baseline=gpts,
+                                             scene_bbox=bounding_box,
+                                             mfilt=mfilt,
+                                                     strict=False)
+    else:
+        model = SARNeRF(
+            config=config,
+            eik_loss_baseline=gpts,
+            scene_bbox=bounding_box,
+            mfilt=mfilt,
+        )
     model.train()
 
     print("======= Training =======")
@@ -107,6 +116,9 @@ if __name__ == '__main__':
     # torch.save(model.state_dict(), config.model_weight_path)
 
     if trainer.is_global_zero:
+        if config.save_model:
+            trainer.save_checkpoint(f'{config.model_weights_path}/{config.model_name}.ckpt')
+
         print('Rendering pulse...')
         mplib.use('TkAgg')
         model.eval()
