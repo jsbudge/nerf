@@ -265,7 +265,7 @@ class SARNeRF(LightningModule):
             self.eik_base = torch.tensor(eik_loss_baseline, dtype=torch.float32)
         else:
             self.use_eik_base = False
-        # self.use_eik_base = False
+        self.use_eik_base = False
 
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input,
                                       config.init_siren, config.hidden_siren, config.network_depth)

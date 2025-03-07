@@ -73,26 +73,26 @@ sarnerf_params:
   # model hyperparams
   model:
     num_samples: 64
-    fine_samples: 24
+    fine_samples: 32
     hidden: 100
-    param_hidden: 64
-    hidden_siren: 10.
-    init_siren: 30.
-    network_depth: 3
-    encoder_sigma: 150.
+    param_hidden: 28
+    hidden_siren: 58.920285341490356
+    init_siren: 66.51829093481844
+    network_depth: 2
+    encoder_sigma: 13.768412101438003
     encoder_size: 5
     wavelength: 0.031228381041666666
     az_half_bw: 0.039269908169872414
     el_half_bw: 0.09599310885968812
-    beta0: 1.
-    activation: gelu
+    beta0: 2.661299599941358
+    activation: silu
   # loss and optimizer hyperparams
   loss:
-    lr_init: .001
+    lr_init: 0.0001
     lr_final: .00005
     lr_delay_steps: 10000
     lr_delay_mult: 0.1
-    weight_decay: 0.00001
+    weight_decay: 0.1
     eikonal_weight: .1
     acc_weight: 1.
   # training hyperparams

@@ -11,14 +11,11 @@ from dataloader import SARNeRFModule
 from model import SARNeRF
 
 def objective(trial: optuna.Trial, config=None, gpts=None, bounding_box=None, mfilt=None):
-    config.init_siren = trial.suggest_float('init_siren', .1, 100.)
     config.hidden_siren = trial.suggest_float('hidden_siren', .1, 100.)
-    config.encoder_sigma = trial.suggest_float('encoder_sigma', .1, 1500.)
-    config.activation = trial.suggest_categorical('activation', ['gelu', 'silu'])
-    config.network_depth = trial.suggest_int('network_depth', 1, 3)
+    config.encoder_sigma = trial.suggest_float('encoder_sigma', .1, 1000.)
     config.beta0 = trial.suggest_float('beta0', .1, 10.)
-    config.lr_init = trial.suggest_categorical('lr', [1e-1, 1e-2, 1e-3, 1e-4])
-    config.weight_decay = trial.suggest_categorical('weight_decay', [0., 1e-1, 1e-2, 1e-3, 1e-5])
+    config.lr_init = trial.suggest_categorical('lr', [1e-1, 1e-2, 1e-3, 1e-4, 1e-6, 1e-9])
+    config.weight_decay = trial.suggest_categorical('weight_decay', [0., 1e-1, 1e-2, 1e-3, 1e-5, 1e-7])
     data = SARNeRFModule(config=config, bounding_box=bounding_box,
                          use_data_file='/home/jeff/repo/nerf/data/SAR_12172024_113146_train.pt')
     data.setup()
