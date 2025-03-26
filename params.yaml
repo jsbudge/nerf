@@ -63,36 +63,36 @@ sarnerf_params:
     log_dir: logs
     sdr_file: /home/jeff/SDR_DATA/RAW/12172024/SAR_12172024_113146.sar
     data_center: [40.093229, -111.768341, 1353.06885]
-    nsam: 3062
-    near_range: 3047.0906
+    nsam: 2420
+    near_range: 2372.5966074068424
     mpp: 1.1991699
-    pulse_std: 741815608.4201782
+    pulse_std: 208.6311
     save_model: False
     model_weights_path: ./logs
     model_name: sarnerf
   # model hyperparams
   model:
-    num_samples: 64
+    num_samples: 32
     fine_samples: 32
-    hidden: 100
-    param_hidden: 28
-    hidden_siren: 58.920285341490356
-    init_siren: 66.51829093481844
-    network_depth: 2
-    encoder_sigma: 13.768412101438003
+    hidden: 512
+    param_hidden: 15
+    hidden_siren: 10.
+    init_siren: 30.
+    network_depth: 1
+    encoder_sigma: 130.
     encoder_size: 5
     wavelength: 0.031228381041666666
     az_half_bw: 0.039269908169872414
     el_half_bw: 0.09599310885968812
-    beta0: 2.661299599941358
+    beta0: 1.
     activation: silu
   # loss and optimizer hyperparams
   loss:
-    lr_init: 0.0001
-    lr_final: .00005
+    lr_init: 0.001
+    lr_final: .005
     lr_delay_steps: 10000
     lr_delay_mult: 0.1
-    weight_decay: 0.1
+    weight_decay: 0.0
     eikonal_weight: .1
     acc_weight: 1.
   # training hyperparams
@@ -102,7 +102,7 @@ sarnerf_params:
     max_steps: -1
     batch_size: 1
     device: cuda
-    ray_samples: 8192
+    ray_samples: 16384
     num_workers: 0
     single_example: False
     distributed: False

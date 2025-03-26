@@ -247,7 +247,7 @@ class SARNeRF(LightningModule):
         self.wavelength = config.wavelength
         # self.automatic_optimization = False
         self.scene_bbox = scene_bbox.astype(np.float32)
-        self.temperature = .1
+        self.temperature = .2
         self.pulse_std = config.pulse_std
         self.eikonal_weight = config.eikonal_weight
         self.sigma = config.encoder_sigma
@@ -270,7 +270,7 @@ class SARNeRF(LightningModule):
         self.sdf_network = SDFNetwork(config.encoder_sigma, config.encoder_size, config.hidden, self.density_input,
                                       config.init_siren, config.hidden_siren, config.network_depth)
 
-        self.param0 = nn.Sequential(
+        '''self.param0 = nn.Sequential(
             nn.Linear(config.hidden, config.param_hidden),
             nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
             nn.Linear(config.param_hidden, config.param_hidden),
@@ -284,7 +284,7 @@ class SARNeRF(LightningModule):
             nn.GELU() if config.activation == 'gelu' else nn.SiLU(),
             nn.Linear(config.param_hidden, 2),
             nn.Softplus(),
-        )
+        )'''
 
         self.beta = nn.Parameter(data=torch.Tensor([config.beta0]), requires_grad=True)
         self.beta_pos = nn.Softplus()
@@ -309,15 +309,7 @@ class SARNeRF(LightningModule):
         near = near[:, hit_mask]
         far = far[:, hit_mask]
 
-        ez_vals = uniform_sample(ray_d, self.num_samples, near, far, randomized=True)
-        pts = ray_o[..., None, :] + ray_d[..., None, :] * ez_vals[..., None]
-        pts = pts.reshape(-1, 3)
-        pts.requires_grad_(True)
-        latent_features, sdf = self.sdf_network(pts, get_features=True)
-        density = laplace_cdf(sdf.reshape(ez_vals.shape), self.get_beta())
-        eweights = self.get_weights(density, ez_vals)
-
-        z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.fine_samples, near, far, self.sdf_network)
+        z_vals = uniform_sample(ray_d, self.num_samples, near, far, randomized=True)
         pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
         pts = pts.reshape(-1, 3)
         pts.requires_grad_(True)
@@ -325,15 +317,23 @@ class SARNeRF(LightningModule):
         density = laplace_cdf(sdf.reshape(z_vals.shape), self.get_beta())
         weights = self.get_weights(density, z_vals)
 
+        '''z_vals, _ = error_bound_sample(ray_d, ray_o, self.get_beta(), self.fine_samples, near, far, self.sdf_network)
+        pts = ray_o[..., None, :] + ray_d[..., None, :] * z_vals[..., None]
+        pts = pts.reshape(-1, 3)
+        pts.requires_grad_(True)
+        latent_features, sdf = self.sdf_network(pts, get_features=True)
+        density = laplace_cdf(sdf.reshape(z_vals.shape), self.get_beta())
+        weights = self.get_weights(density, z_vals)'''
+
         # predict params and reshape for use later
-        enc_mean = positional_encoding(pts, self.sigma, self.encoder_size)
+        '''enc_mean = positional_encoding(pts, self.sigma, self.encoder_size)
         params = self.param0(latent_features)
         params = torch.cat([params, enc_mean], dim=-1)
-        params = self.param1(params).reshape((ray_o.shape[0], -1, self.fine_samples, 2)) + .001
+        params = self.param1(params).reshape((ray_o.shape[0], -1, self.fine_samples, 2)) + .00001'''
         acc = torch.sum(weights, dim=-1)
         distance = torch.sum(weights * z_vals, dim=-1) / acc
         distance = torch.clamp(torch.nan_to_num(distance), z_vals[..., 0], z_vals[..., -1])
-        params = torch.sum(weights[..., None] * params, dim=-2) / acc[..., None]
+        # params = torch.sum(weights[..., None] * params, dim=-2) / acc[..., None]
 
         # Detach gradients from autograd so they don't influence backpropagation
         pts.requires_grad_(True)
@@ -344,10 +344,10 @@ class SARNeRF(LightningModule):
             bounce = normals * torch.sum(ray_d * normals, dim=-1)[..., None] * 2 - ray_d
 
         # Phong reflection formulation, phong to be added later
-        '''ref_model = (torch.sum(ray_d * normals, dim=-1) + torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 2 * ray_p.squeeze(-1)'''
-        ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
-            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1) / 16.
+        ref_model = (torch.clamp_min(torch.sum(ray_d * normals, dim=-1), 0.) + torch.nan_to_num(
+            torch.clamp_min(torch.sum(bounce * normals, dim=-1), 0.))) / (2 * distance) ** 2 * ray_p.squeeze(-1)
+        '''ref_model = (params[..., 0] * torch.sum(ray_d * normals, dim=-1) + params[..., 1] * torch.nan_to_num(
+            torch.abs(torch.sum(bounce * normals, dim=-1)))) / distance ** 4 * ray_p.squeeze(-1) / 16.'''
         # ref_model = ray_p.squeeze(-1) / torch.square(distance)
 
         # Get soft buckets to preserve gradients across histogramming step
@@ -355,20 +355,22 @@ class SARNeRF(LightningModule):
         soft_buckets = torch.softmax(-bound_dist / self.temperature, dim=-1)
 
         # Calculate out expected phase as well
-        ret = torch.view_as_real(ref_model * torch.exp(-4j * torch.pi / self.wavelength * distance))
+        ret = torch.cat([(ref_model * torch.cos(-4 * torch.pi / self.wavelength * distance)).unsqueeze(-1),
+                         (ref_model * torch.sin(-4 * torch.pi / self.wavelength * distance)).unsqueeze(-1)], dim=-1)
+        # ret = torch.view_as_real(ref_model * torch.exp(-4j * torch.pi / self.wavelength * distance))
 
         # Soft histogram step, along with applying filtered chirp in frequency domain
         comp_pulse = ret[:, :, None, :] * soft_buckets[:, :, :, None]
-        comp_pulse = torch.sum(comp_pulse, dim=-3) / (1e-12 + torch.sum(soft_buckets, dim=-2))[..., None]
-        comp_pulse = torch.view_as_complex(comp_pulse)
+        comp_pulse = torch.sum(comp_pulse, dim=-3) / (1e-12 + torch.sum(soft_buckets, dim=-2))[..., None] / self.pulse_std
+        '''comp_pulse = torch.view_as_complex(comp_pulse)
         comp_pulse = torch.fft.ifft(torch.fft.fft(comp_pulse, self.mfilt.shape[-1], dim=-1) *
-                                    self.mfilt.to(self.device), dim=-1)[..., :self.nsam]
-        comp_pulse = torch.view_as_real(comp_pulse) / self.pulse_std
+                                    self.mfilt.to(self.device), dim=-1)[..., :self.nsam]'''
+        # comp_pulse = torch.view_as_real(comp_pulse)#  / self.pulse_std
         if return_occ:
             return sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1)), z_vals, density.reshape((ray_o.shape[0], -1, self.fine_samples, 1)), weights
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
-            return comp_pulse, distance, ez_vals, eweights
+            return comp_pulse, distance, z_vals, weights
             # return sdf.reshape((ray_o.shape[0], -1, self.fine_samples, 1))
 
     def get_beta(self):
@@ -432,6 +434,11 @@ class SARNeRF(LightningModule):
             ax.set_zlim(self.scene_bbox[0, 2], self.scene_bbox[1, 2])
             self.logger.experiment.add_figure('Density Plot', fig, global_step=self.global_step)
             plt.close(fig)'''
+        # Log weight histogram
+        if self.global_step % 100 == 0 and self.trainer.is_global_zero:
+            for name, param in self.named_parameters():
+                if 'weight' in name:
+                    self.logger.experiment.add_histogram(name, param, self.global_step)
         if self.automatic_optimization:
             return self.loss
 
@@ -441,6 +448,7 @@ class SARNeRF(LightningModule):
             opt.zero_grad()
             self.manual_backward(self.loss, retain_graph=True)
             self.loss = None
+            # self.clip_gradients(opt, .5, gradient_clip_algorithm="value")
             opt.step()
         self.lr_schedulers().step()
 
@@ -467,6 +475,7 @@ class SARNeRF(LightningModule):
         eik_pts.requires_grad_(True)
         grad_theta = diff_ops.gradient(self.sdf_network(eik_pts), eik_pts)
         eik_loss = eikonal_loss(grad_theta) + eik_loss
+        # eik_loss = 0.
 
         pulses, dists, z_vals, weights = self.forward(ray_d, ray_o, ray_p)
 
@@ -474,15 +483,21 @@ class SARNeRF(LightningModule):
         pdf_weights = pdf_weights / torch.sum(pdf_weights, dim=-1, keepdim=True)
         density_entropy = torch.mean(torch.sum(torch.log(pdf_weights * self.fine_samples) * pdf_weights, dim=-1))
 
-        density_std = self.sdf_network(eik_pts).std()
+        density_std = 0  #self.sdf_network(eik_pts).std()
 
-        dloss = density_entropy + eik_loss * self.eikonal_weight
+        dloss = eik_loss * self.eikonal_weight # +
+        norm_pulse_data = torch.view_as_complex(pulses)
+        norm_pulse_data = norm_pulse_data / torch.sqrt(torch.sum(norm_pulse_data * torch.conj(norm_pulse_data),
+                                                                 dim=1))[:, None]
+        norm_target_data = torch.view_as_complex(target_data)
+        norm_target_data = norm_target_data / torch.sqrt(torch.sum(norm_target_data * torch.conj(norm_target_data),
+                                                                 dim=1))[:, None]
 
-        loss = torch.square(
-            torch.abs(torch.view_as_complex(target_data)) - torch.abs(torch.view_as_complex(pulses))).mean() + dloss
+        loss = 1e5 * torch.square(
+            torch.abs(norm_target_data) - torch.abs(norm_pulse_data)).mean() + dloss
 
         with torch.no_grad():
-            psnr = mse_to_psnr(((target_data - pulses) ** 2).mean())
+            psnr = mse_to_psnr((torch.abs(norm_target_data - norm_pulse_data) ** 2).mean())
 
         self.loss = loss
 
@@ -526,8 +541,10 @@ class SDFNetwork(LightningModule):
                 nn.Linear(input_layer_sz if i == 0 else hidden + input_layer_sz, hidden),
                 nn.Softplus(),
             ))
-            self.sdf_net.append(Siren(input_layer_sz if i == 0 else hidden, hidden,
-                                      w0=init_siren if i == 0 else hidden_siren, is_first = i == 0))
+            self.sdf_net.append(
+                Siren(input_layer_sz if i == 0 else hidden, hidden, w0=init_siren if i == 0 else hidden_siren,
+                      is_first = i == 0),
+        )
         self.final_sdf = nn.Sequential(
             nn.Linear(hidden, 1),
         )

@@ -514,7 +514,7 @@ class BaseSDRDataset(Dataset):
                  fc: float = 9.6e9, az_bw: float = 1., el_bw: float = 1.):
         tran_gain_db = 30.
         rec_gain_db = 30.
-        amp_gain_db = 50.
+        amp_gain_db = 150.
         tran_power_watt = 100.
         self.radar_coeff = np.float32(
             c0 ** 2 / fc ** 2 * tran_power_watt * 10 ** (
@@ -530,9 +530,13 @@ class BaseSDRDataset(Dataset):
 
         '''self.az_vals = torch.distributions.Uniform(-self.az_bw * 3, self.az_bw * 3)
         self.el_vals = torch.distributions.Beta(1, 3)'''
-        self.x_vals = torch.distributions.Uniform(box[0, 0] + 1, box[1, 0] - 1)
+        '''self.x_vals = torch.distributions.Uniform(box[0, 0] + 1, box[1, 0] - 1)
         self.y_vals = torch.distributions.Uniform(box[0, 1] + 1, box[1, 1] - 1)
-        self.z_vals = torch.distributions.Uniform(box[0, 2] + 1, box[1, 2] - 1)
+        self.z_vals = torch.distributions.Uniform(box[0, 2] + 1, box[1, 2] - 1)'''
+        points = torch.load('/home/jeff/repo/nerf/data/simulator_points.pt')[0]
+        self.x_vals = torch.tensor(points[:, 0], dtype=torch.float32).unsqueeze(1)
+        self.y_vals = torch.tensor(points[:, 1], dtype=torch.float32).unsqueeze(1)
+        self.z_vals = torch.tensor(points[:, 2], dtype=torch.float32).unsqueeze(1)
 
     def __getitem__(self, p_idx):
         ray_d, ray_o, ray_p = self.generate_rays(self.data[p_idx])
@@ -543,9 +547,9 @@ class BaseSDRDataset(Dataset):
 
     def generate_rays(self, ray_info):
         # Generate random rays for sampling
-        x_vals = self.x_vals.rsample((self.ray_samples, 1))
-        y_vals = self.y_vals.rsample((self.ray_samples, 1))
-        z_vals = self.z_vals.rsample((self.ray_samples, 1))
+        x_vals = self.x_vals  #.rsample((self.ray_samples, 1))
+        y_vals = self.y_vals  #.rsample((self.ray_samples, 1))
+        z_vals = self.z_vals  #.rsample((self.ray_samples, 1))
         vecs = torch.cat([x_vals - ray_info[..., 0], y_vals - ray_info[..., 1], z_vals - ray_info[..., 2]], dim=-1)
         vecs = vecs / torch.linalg.norm(vecs, dim=-1)[:, None]
         az_vals = torch.arctan2(vecs[:, 0], vecs[:, 1]).view(-1, 1)

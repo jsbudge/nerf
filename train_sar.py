@@ -18,7 +18,7 @@ from model import SARNeRF
 import matplotlib.pyplot as plt
 import open3d as o3d
 import matplotlib as mplib
-
+mplib.use('TkAgg')
 from utils import laplace_cdf
 
 pio.renderers.default = 'browser'
@@ -51,13 +51,14 @@ if __name__ == '__main__':
     sdr_f = load(config.sdr_file)
     rp = SDRPlatform(sdr_f, origin=config.data_center, fs=sdr_f[0].fs)
 
-    nsam, nr, ranges, ranges_sampled, near_range_s, granges, fft_len, up_fft_len = (
+    _, _, _, _, _, granges, _, _ = (
         rp.getRadarParams(0., 0., 1))
+    nsam = config.nsam
     # Calculate out ground ranges for sphere intersections
     av_hght = rp.pos(rp.gpst).mean(axis=0)[2]
     near_grange = granges[0]
     far_grange = granges[-1]
-    sph_inter = (far_grange - near_grange)
+    sph_inter = 250 # (far_grange - near_grange)
 
     bg = SDREnvironment(sdr_f, origin=config.data_center)
     gx, gy, gz = bg.getGrid(config.data_center, sph_inter, sph_inter, 80, 80)
@@ -65,8 +66,7 @@ if __name__ == '__main__':
     glat, glon, galt = enu2llh(gx.flatten(), gy.flatten(), gz.flatten(), bg.ref)
     gx, gy, gz = llh2enu(glat, glon, galt, rp.origin)
 
-    mfilt = torch.tensor(sdr_f.genMatchedFilter(0, fft_len=fft_len) * np.fft.fft(sdr_f[0].cal_chirp, fft_len),
-                         dtype=torch.complex64)
+    mfilt = torch.load('/home/jeff/repo/nerf/data/sim_mfilt.pt')[0]
 
     # Only get the ones inside the scene sphere
     gpts = np.dstack((gx, gy, gz))[0]
@@ -76,7 +76,7 @@ if __name__ == '__main__':
 
     print('Loading data...')
     data = SARNeRFModule(config=config, bounding_box=bounding_box,
-                         use_data_file='/home/jeff/repo/nerf/data/SAR_12172024_113146_train.pt')
+                         use_data_file='/home/jeff/repo/nerf/data/simulator_train.pt')
     data.setup()
     logger = loggers.TensorBoardLogger(config.log_dir, name="SARNeRF", version=0, log_graph=True)
 
@@ -124,8 +124,11 @@ if __name__ == '__main__':
         model.eval()
         model.to(device)
 
+        ranges = model.pulse_bins.cpu().data.numpy()
+
         # Generate points from sphere for sampling the function
-        pts = torch.cat([model.eik_base, torch.rand(size=(model.eik_base.shape[0], 3)) * np.diff(model.scene_bbox, axis=0) + model.scene_bbox[0]], dim=0).to(model.device)
+        # pts = torch.cat([model.eik_base, torch.rand(size=(model.eik_base.shape[0], 3)) * np.diff(model.scene_bbox, axis=0) + model.scene_bbox[0]], dim=0).to(model.device)
+        pts = (torch.rand(size=(model.eik_base.shape[0], 3)) * np.diff(model.scene_bbox, axis=0) + model.scene_bbox[0]).to(model.device)
 
         sdf_test, norm_test = model.sample_density_function(pts=pts)
         density_test = laplace_cdf(sdf_test, model.get_beta()).cpu().data.numpy().flatten()
@@ -151,19 +154,13 @@ if __name__ == '__main__':
         distances = dist_tensor[0].cpu().data.numpy()
         densities = laplace_cdf(sdf_tensor, model.get_beta())
 
-        nsam, nr, ranges, ranges_sampled, near_range_s, granges, fft_len, up_fft_len = (
-                rp.getRadarParams(0, 0., 1))
-
-        mfilt = sdr_f.genMatchedFilter(0, fft_len=fft_len)
-        test = np.fft.ifft(np.fft.fft(sdr_f.getPulse(10)[1].flatten(), fft_len) * mfilt)[:nsam]
-
         plt.figure()
-        plt.subplot(3, 1, 1)
+        plt.subplot(2, 1, 1)
+        plt.title('Generated Pulse')
         plt.plot(ranges, abs(np_pulse))
-        plt.subplot(3, 1, 2)
+        plt.subplot(2, 1, 2)
+        plt.title('Truth Pulse')
         plt.plot(ranges, abs(np_target))
-        plt.subplot(3, 1, 3)
-        plt.plot(ranges, abs(test))
         plt.show()
 
         # Calculate sphere intersections for near and far
